@@ -133,10 +133,10 @@ function waitForCvMat(timeoutMs = 60000): Promise<void> {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function imageDataToMat(data: ImageData): any {
-  const off = new OffscreenCanvas(data.width, data.height);
-  const ctx = off.getContext('2d')!;
-  ctx.putImageData(data, 0, 0);
-  return cv.imread(off);
+  // cv.imread() expects an HTMLImageElement/HTMLCanvasElement, which doesn't
+  // exist in workers. cv.matFromImageData() takes raw ImageData and works
+  // in any context (main thread or worker).
+  return cv.matFromImageData(data);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
