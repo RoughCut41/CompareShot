@@ -3,7 +3,6 @@
  * Handles spawning the worker, downscaling images on the main thread (fast),
  * and translating worker messages back into the SmartAlignReport shape.
  */
-import { ImageState } from '@/lib/types';
 import { decodeImage } from '@/lib/exportRenderer';
 import {
   AlignableSlot,
@@ -113,12 +112,3 @@ export async function featureAlignViaWorker(
     worker.postMessage({ type: 'run', slots: payloads }, transferables);
   });
 }
-
-/**
- * For images affected by the alignment, the ImageData buffers were transferred
- * to the worker. We need to re-decode the canvas-based images to keep them
- * usable on the main thread. Since we hold the original Image elements alive
- * via the ImageState.url, we don't actually need to do anything — the images
- * are still valid. The ImageData buffer transfer only neuters the *copy* we
- * made for the worker.
- */
