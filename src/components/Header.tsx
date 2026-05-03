@@ -6,9 +6,16 @@ interface Props {
   category: Category;
   comparisonIndex: number;
   onDeleteAll: () => void;
+  onOpenDebugReport: () => void;
 }
 
-export function Header({ comparison, category, comparisonIndex, onDeleteAll }: Props) {
+export function Header({
+  comparison,
+  category,
+  comparisonIndex,
+  onDeleteAll,
+  onOpenDebugReport,
+}: Props) {
   return (
     <header className="flex flex-shrink-0 items-center justify-between border-b border-zinc-800 bg-background px-4 py-3">
       <div className="flex items-center gap-2">
@@ -22,6 +29,7 @@ export function Header({ comparison, category, comparisonIndex, onDeleteAll }: P
         category={category}
         comparisonIndex={comparisonIndex}
         onDeleteAll={onDeleteAll}
+        onOpenDebugReport={onOpenDebugReport}
       />
     </header>
   );
