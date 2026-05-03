@@ -258,8 +258,11 @@ export function ImageContainer({ state, slotIndex, onUpdate, onSetImage, onDelet
         accept="image/*,.heic,.heif"
         className="hidden"
         onChange={(e) => {
-          const files = e.target.files;
-          // Reset the input first so re-uploading the same file works
+          // Convert FileList to array IMMEDIATELY — some browsers null the FileList
+          // when the input value is reset, so we have to grab references first.
+          const files = e.target.files ? Array.from(e.target.files) : [];
+          console.log('[CompareShot] onChange fired, files:', files.length);
+          // Now safe to reset the input so re-uploading the same file works
           e.target.value = '';
           void handleFiles(files);
         }}
