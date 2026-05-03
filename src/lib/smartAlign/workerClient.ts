@@ -62,7 +62,7 @@ export async function featureAlignViaWorker(
   return new Promise<SmartAlignReport>((resolve, reject) => {
     let worker: Worker;
     try {
-      worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+      worker = new Worker(new URL('./worker.ts', import.meta.url));
     } catch (err) {
       reject(err);
       return;
