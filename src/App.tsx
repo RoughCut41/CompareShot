@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useCompareStore } from '@/hooks/useCompareStore';
 import { Header } from '@/components/Header';
 import { CategoryTabs } from '@/components/CategoryTabs';
@@ -6,12 +6,26 @@ import { ComparisonTabs } from '@/components/ComparisonTabs';
 import { Toolbar } from '@/components/Toolbar';
 import { RulerWorkspace } from '@/components/RulerWorkspace';
 import { ImageGrid } from '@/components/ImageGrid';
-import { smartAlign } from '@/lib/smartAlign';
+import { DebugReportModal } from '@/components/DebugReportModal';
+import { smartAlign, type SmartAlignReport } from '@/lib/smartAlign';
+import { installLogCapture } from '@/lib/logCapture';
+import { buildDebugReport } from '@/lib/debugReport';
+
+const APP_VERSION = '0.2.0-phase2';
 
 export default function App() {
   const store = useCompareStore();
   const [aligning, setAligning] = useState(false);
   const [alignStatus, setAlignStatus] = useState<string | null>(null);
+  const [lastAlignReport, setLastAlignReport] = useState<SmartAlignReport | null>(null);
+  const [lastAlignError, setLastAlignError] = useState<string | null>(null);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [debugReport, setDebugReport] = useState('');
+
+  useEffect(() => {
+    installLogCapture();
+    console.log('[CompareShot] App mounted, version', APP_VERSION);
+  }, []);
 
   const slotCount = store.activeComparison?.images.length ?? 0;
   const filledCount = (store.activeComparison?.images ?? []).filter((i) => i !== null).length;
@@ -21,13 +35,14 @@ export default function App() {
     if (!store.activeComparison || !canAlign) return;
     setAligning(true);
     setAlignStatus('Loading…');
+    setLastAlignError(null);
     try {
       const report = await smartAlign({
         images: store.activeComparison.images,
         onProgress: (label) => setAlignStatus(label),
       });
+      setLastAlignReport(report);
 
-      // Apply the computed transforms to the slots
       for (const result of report.results) {
         if (result.status === 'aligned' && result.transform) {
           store.updateImage(result.slotIndex, {
@@ -35,13 +50,11 @@ export default function App() {
             panX: result.transform.panX,
             panY: result.transform.panY,
             rotation: result.transform.rotation,
-            // Reset flips — alignment assumes upright images
             flipH: false,
             flipV: false,
             freeRotateActive: false,
           });
         } else if (result.status === 'reference') {
-          // Reset reference to identity (no transform applied)
           store.updateImage(result.slotIndex, {
             zoom: 1,
             panX: 0,
@@ -54,7 +67,6 @@ export default function App() {
         }
       }
 
-      // Brief summary in the button before clearing
       const aligned = report.results.filter((r) => r.status === 'aligned').length;
       const failed = report.results.filter((r) => r.status === 'failed').length;
       const modeLabel = report.mode === 'face' ? 'face' : 'features';
@@ -63,13 +75,14 @@ export default function App() {
           ? `Aligned ${aligned} (${failed} failed) · ${modeLabel}`
           : `Aligned ${aligned} · ${modeLabel}`
       );
-      // Auto-clear status after a moment
       window.setTimeout(() => {
         setAlignStatus(null);
         setAligning(false);
       }, 2200);
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       console.error('[CompareShot] Smart Align failed:', err);
+      setLastAlignError(msg);
       setAlignStatus('Failed');
       window.setTimeout(() => {
         setAlignStatus(null);
@@ -78,6 +91,19 @@ export default function App() {
     }
   }, [store, canAlign]);
 
+  const handleOpenDebug = useCallback(() => {
+    const report = buildDebugReport({
+      data: store.data,
+      activeCategory: store.activeCategory,
+      activeIndex: store.activeIndex,
+      lastSmartAlignReport: lastAlignReport,
+      lastSmartAlignError: lastAlignError,
+      appVersion: APP_VERSION,
+    });
+    setDebugReport(report);
+    setDebugOpen(true);
+  }, [store.data, store.activeCategory, store.activeIndex, lastAlignReport, lastAlignError]);
+
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-zinc-200">
       <Header
@@ -85,6 +111,7 @@ export default function App() {
         category={store.activeCategory}
         comparisonIndex={store.activeIndex[store.activeCategory]}
         onDeleteAll={store.deleteAllPhotos}
+        onOpenDebugReport={handleOpenDebug}
       />
       <CategoryTabs active={store.activeCategory} onSelect={store.switchCategory} />
       <ComparisonTabs
@@ -113,6 +140,8 @@ export default function App() {
           />
         )}
       </RulerWorkspace>
+
+      <DebugReportModal open={debugOpen} report={debugReport} onClose={() => setDebugOpen(false)} />
     </div>
   );
 }
