@@ -1,14 +1,23 @@
 /**
- * Smart Align Web Worker.
+ * Smart Align Web Worker (Classic worker, supports importScripts).
  *
- * Loads OpenCV.js + face-api.js in a separate thread so the main UI never
- * freezes during heavy computation. The main thread sends down-scaled
- * ImageData arrays + image metadata; the worker returns AlignTransform
- * objects ready to apply.
+ * Loads OpenCV.js in a separate thread so the main UI never freezes during
+ * heavy computation. The main thread sends down-scaled ImageData arrays +
+ * image metadata; the worker returns AlignTransform objects ready to apply.
  */
 
 /// <reference lib="webworker" />
-declare const self: DedicatedWorkerGlobalScope;
+
+declare const self: WorkerGlobalScope &
+  typeof globalThis & {
+    importScripts: (...urls: string[]) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    cv?: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    postMessage: (msg: any) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    onmessage: ((e: MessageEvent) => any) | null;
+  };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const cv: any;
@@ -24,14 +33,10 @@ interface AlignTransform {
 
 interface SlotPayload {
   slotIndex: number;
-  /** Down-scaled ImageData for analysis (e.g. 800px max edge) */
   imageData: ImageData;
-  /** Scale factor used to produce imageData from the natural image */
   preScale: number;
-  /** Original image dimensions */
   naturalWidth: number;
   naturalHeight: number;
-  /** Container size at time of analysis */
   containerW: number;
   containerH: number;
 }
@@ -89,10 +94,7 @@ function loadOpenCV(): Promise<void> {
     for (const url of OPENCV_URLS) {
       try {
         progress(`Loading OpenCV from ${new URL(url).hostname}…`);
-        // importScripts is synchronous in workers and tolerates WASM init
-        // without freezing the main thread.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (self as any).importScripts(url);
+        self.importScripts(url);
         progress('Initializing OpenCV runtime…');
         await waitForCvMat();
         return;
@@ -109,8 +111,7 @@ function waitForCvMat(timeoutMs = 60000): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     const tick = () => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const c = (self as any).cv;
+      const c = self.cv;
       if (c && c.Mat) {
         resolve();
         return;
@@ -132,7 +133,6 @@ function waitForCvMat(timeoutMs = 60000): Promise<void> {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function imageDataToMat(data: ImageData): any {
-  // OffscreenCanvas works inside workers and lets us use cv.imread directly
   const off = new OffscreenCanvas(data.width, data.height);
   const ctx = off.getContext('2d')!;
   ctx.putImageData(data, 0, 0);
@@ -223,7 +223,6 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
     akaze.delete();
   }
 
-  // ---- Pick reference ----
   progress('Choosing reference…');
   const matchSums = new Array(features.length).fill(0);
   const matcher = new cv.BFMatcher(cv.NORM_HAMMING, false);
@@ -266,7 +265,6 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
   const reference = features[refLocal];
   const referenceSlotIndex = reference.payload.slotIndex;
 
-  // ---- Pairwise alignment ----
   const results: AlignResultPayload[] = [];
   for (let i = 0; i < features.length; i++) {
     if (i === refLocal) {
@@ -277,10 +275,14 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
     const cur = features[i];
     const matcher2 = new cv.BFMatcher(cv.NORM_HAMMING, false);
     const knn = new cv.DMatchVectorVector();
-    let srcMat = null,
-      dstMat = null,
-      inliers = null,
-      M = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let srcMat: any = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let dstMat: any = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let inliers: any = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let M: any = null;
     try {
       matcher2.knnMatch(cur.desc, reference.desc, knn, 2);
       const good: { q: number; t: number }[] = [];
@@ -375,7 +377,6 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
     }
   }
 
-  // Cleanup all features
   for (const f of features) {
     f.mat.delete();
     f.gray.delete();
