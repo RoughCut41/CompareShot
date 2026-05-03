@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Download, LayoutGrid, Trash2 } from 'lucide-react';
+import { Bug, Download, LayoutGrid, Trash2 } from 'lucide-react';
 import { Category, Comparison, SLOT_LETTERS } from '@/lib/types';
 import {
   canvasToPngBlob,
@@ -13,9 +13,16 @@ interface Props {
   category: Category;
   comparisonIndex: number;
   onDeleteAll: () => void;
+  onOpenDebugReport: () => void;
 }
 
-export function DownloadActions({ comparison, category, comparisonIndex, onDeleteAll }: Props) {
+export function DownloadActions({
+  comparison,
+  category,
+  comparisonIndex,
+  onDeleteAll,
+  onOpenDebugReport,
+}: Props) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState<'collage' | 'photos' | null>(null);
 
@@ -48,7 +55,7 @@ export function DownloadActions({ comparison, category, comparisonIndex, onDelet
         const blob = await canvasToPngBlob(canvas);
         const letter = SLOT_LETTERS[i] ?? `${i + 1}`;
         downloadBlob(blob, `${letter}-${category}-${comparisonIndex + 1}.png`);
-        await sleep(200); // small delay to keep the browser happy
+        await sleep(200);
       }
     } catch (err) {
       console.error('Photo export failed', err);
@@ -61,7 +68,6 @@ export function DownloadActions({ comparison, category, comparisonIndex, onDelet
   function handleDeleteAll() {
     if (!confirming) {
       setConfirming(true);
-      // Auto-cancel after 4s if user doesn't confirm
       setTimeout(() => setConfirming(false), 4000);
       return;
     }
@@ -71,6 +77,15 @@ export function DownloadActions({ comparison, category, comparisonIndex, onDelet
 
   return (
     <div className="flex items-center gap-1.5">
+      <button
+        onClick={onOpenDebugReport}
+        className="flex items-center gap-1.5 rounded-md border border-zinc-800 px-3 py-1.5 text-xs text-zinc-400 transition-colors hover:border-amber-500/40 hover:bg-amber-500/10 hover:text-amber-300"
+        title="Debug-Report öffnen"
+      >
+        <Bug size={12} />
+        Debug report
+      </button>
+
       <button
         onClick={handleDeleteAll}
         className={`flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs transition-colors ${
