@@ -12,6 +12,7 @@
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\""
   },
   "dependencies": {
+    "@vladmandic/face-api": "^1.7.13",
     "heic2any": "^0.0.4",
     "lucide-react": "^0.460.0",
     "react": "^18.3.1",
