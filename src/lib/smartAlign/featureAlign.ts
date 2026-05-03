@@ -38,9 +38,12 @@ function computeCoverScale(naturalW: number, naturalH: number, containerW: numbe
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function imageToMat(cv: any, img: HTMLImageElement, maxDim = 1600) {
-  // Downscale very large images before feature detection — AKAZE on a 48 MP
-  // photo takes seconds and yields no better matches than 1600 px.
+function imageToMat(cv: any, img: HTMLImageElement, maxDim = 800) {
+  // Aggressively downscale before feature detection. AKAZE on a multi-MP photo
+  // will freeze the browser tab for tens of seconds; on an 800-px-edge image
+  // it runs in well under a second with effectively the same match quality.
+  // The transform we compute is then applied to the *original* image at full
+  // resolution — only the analysis runs on the small version.
   const ratio = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
   const w = Math.round(img.naturalWidth * ratio);
   const h = Math.round(img.naturalHeight * ratio);
@@ -100,8 +103,11 @@ async function extractFeatures(cv: any, slots: AlignableSlot[]): Promise<ImageFe
   const features: ImageFeatures[] = [];
   try {
     for (const slot of slots) {
+      // Yield to the browser before each heavy step so the UI can repaint
+      await new Promise((r) => setTimeout(r, 0));
       const img = await decodeImage(slot.state.url);
       const { mat, scale } = imageToMat(cv, img);
+      await new Promise((r) => setTimeout(r, 0));
       const gray = new cv.Mat();
       cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
       const kp = new cv.KeyPointVector();
@@ -109,6 +115,7 @@ async function extractFeatures(cv: any, slots: AlignableSlot[]): Promise<ImageFe
       const noMask = new cv.Mat();
       akaze.detectAndCompute(gray, noMask, kp, desc);
       noMask.delete();
+      console.log('[CompareShot] Slot', slot.slotIndex, '— AKAZE keypoints:', kp.size());
       features.push({
         slotIndex: slot.slotIndex,
         mat,
@@ -193,9 +200,13 @@ interface PairAlignResult {
 function alignPair(cv: any, current: ImageFeatures, reference: ImageFeatures): PairAlignResult | null {
   const matcher = new cv.BFMatcher(cv.NORM_HAMMING, false);
   const knn = new cv.DMatchVectorVector();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let srcMat: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let dstMat: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let inliers: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let M: any = null;
   try {
     matcher.knnMatch(current.desc, reference.desc, knn, 2);
@@ -368,6 +379,8 @@ export async function featureAlign(
         continue;
       }
       onProgress?.(`Aligning ${i + 1}/${features.length}…`);
+      // Yield to browser between alignments
+      await new Promise((r) => setTimeout(r, 0));
       const pair = alignPair(cv, f, reference);
       if (!pair) {
         results.push({
