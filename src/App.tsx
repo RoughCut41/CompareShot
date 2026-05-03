@@ -11,7 +11,7 @@ import { smartAlign, type SmartAlignReport } from '@/lib/smartAlign';
 import { installLogCapture } from '@/lib/logCapture';
 import { buildDebugReport } from '@/lib/debugReport';
 
-const APP_VERSION = '0.2.0-phase2';
+const APP_VERSION = '0.2.1-phase2';
 
 export default function App() {
   const store = useCompareStore();
@@ -32,15 +32,28 @@ export default function App() {
   const canAlign = filledCount >= 2;
 
   const handleSmartAlign = useCallback(async () => {
-    if (!store.activeComparison || !canAlign) return;
+    console.log('[CompareShot] Smart Align button clicked');
+    if (!store.activeComparison) {
+      console.warn('[CompareShot] No active comparison — aborting');
+      return;
+    }
+    if (!canAlign) {
+      console.warn('[CompareShot] Not enough images — aborting');
+      return;
+    }
+    console.log('[CompareShot] Starting Smart Align with', filledCount, 'images');
     setAligning(true);
     setAlignStatus('Loading…');
     setLastAlignError(null);
     try {
       const report = await smartAlign({
         images: store.activeComparison.images,
-        onProgress: (label) => setAlignStatus(label),
+        onProgress: (label) => {
+          console.log('[CompareShot] Progress:', label);
+          setAlignStatus(label);
+        },
       });
+      console.log('[CompareShot] Smart Align complete:', report);
       setLastAlignReport(report);
 
       for (const result of report.results) {
@@ -82,14 +95,18 @@ export default function App() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[CompareShot] Smart Align failed:', err);
+      if (err instanceof Error && err.stack) {
+        console.error('[CompareShot] Stack:', err.stack);
+      }
       setLastAlignError(msg);
-      setAlignStatus('Failed');
+      setAlignStatus('Failed: ' + msg.slice(0, 30));
+      // Always release the button — no matter what
       window.setTimeout(() => {
         setAlignStatus(null);
         setAligning(false);
-      }, 2500);
+      }, 3000);
     }
-  }, [store, canAlign]);
+  }, [store, canAlign, filledCount]);
 
   const handleOpenDebug = useCallback(() => {
     const report = buildDebugReport({
