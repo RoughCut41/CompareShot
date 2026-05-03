@@ -180,6 +180,111 @@ interface FeatureSet {
   kpCount: number;
 }
 
+// ---- Similarity Transform via RANSAC (replacement for cv.estimateAffinePartial2D) ----
+
+interface Similarity {
+  a: number;
+  b: number;
+  tx: number;
+  ty: number;
+}
+
+function fitSimilarityFromTwoPairs(
+  src: number[],
+  dst: number[],
+  i: number,
+  j: number
+): Similarity | null {
+  const x1 = src[i * 2], y1 = src[i * 2 + 1];
+  const x2 = src[j * 2], y2 = src[j * 2 + 1];
+  const u1 = dst[i * 2], v1 = dst[i * 2 + 1];
+  const u2 = dst[j * 2], v2 = dst[j * 2 + 1];
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const det = dx * dx + dy * dy;
+  if (det < 1e-9) return null;
+  const du = u2 - u1;
+  const dv = v2 - v1;
+  const a = (dx * du + dy * dv) / det;
+  const b = (dx * dv - dy * du) / det;
+  const tx = u1 - a * x1 + b * y1;
+  const ty = v1 - b * x1 - a * y1;
+  return { a, b, tx, ty };
+}
+
+function fitSimilarityLeastSquares(
+  src: number[],
+  dst: number[],
+  inlierIdx: number[]
+): Similarity | null {
+  const n = inlierIdx.length;
+  if (n < 2) return null;
+  let sx = 0, sy = 0, su = 0, sv = 0;
+  let sxx_yy = 0, sxu_yv = 0, sxv_yu = 0;
+  for (const k of inlierIdx) {
+    const x = src[k * 2], y = src[k * 2 + 1];
+    const u = dst[k * 2], v = dst[k * 2 + 1];
+    sx += x;
+    sy += y;
+    su += u;
+    sv += v;
+    sxx_yy += x * x + y * y;
+    sxu_yv += x * u + y * v;
+    sxv_yu += x * v - y * u;
+  }
+  const denom = n * sxx_yy - sx * sx - sy * sy;
+  if (Math.abs(denom) < 1e-9) return null;
+  const a = (n * sxu_yv - sx * su - sy * sv) / denom;
+  const b = (n * sxv_yu - sx * sv + sy * su) / denom;
+  const tx = (su - a * sx + b * sy) / n;
+  const ty = (sv - b * sx - a * sy) / n;
+  return { a, b, tx, ty };
+}
+
+function estimateSimilarityRANSAC(
+  src: number[],
+  dst: number[],
+  iterations = 300,
+  threshold = 3
+): Similarity | null {
+  const n = src.length / 2;
+  if (n < 2) return null;
+
+  let bestModel: Similarity | null = null;
+  let bestInliers: number[] = [];
+
+  for (let iter = 0; iter < iterations; iter++) {
+    const i = Math.floor(Math.random() * n);
+    let j = Math.floor(Math.random() * n);
+    if (i === j) j = (j + 1) % n;
+
+    const model = fitSimilarityFromTwoPairs(src, dst, i, j);
+    if (!model) continue;
+
+    const inliers: number[] = [];
+    for (let k = 0; k < n; k++) {
+      const x = src[k * 2], y = src[k * 2 + 1];
+      const u = dst[k * 2], v = dst[k * 2 + 1];
+      const pu = model.a * x - model.b * y + model.tx;
+      const pv = model.b * x + model.a * y + model.ty;
+      const du = pu - u;
+      const dv = pv - v;
+      if (du * du + dv * dv < threshold * threshold) {
+        inliers.push(k);
+      }
+    }
+
+    if (inliers.length > bestInliers.length) {
+      bestInliers = inliers;
+      bestModel = model;
+    }
+  }
+
+  if (!bestModel || bestInliers.length < 4) return null;
+  const refined = fitSimilarityLeastSquares(src, dst, bestInliers);
+  return refined ?? bestModel;
+}
+
 // ---- Main alignment routine ----
 
 async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
@@ -275,14 +380,6 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
     const cur = features[i];
     const matcher2 = new cv.BFMatcher(cv.NORM_HAMMING, false);
     const knn = new cv.DMatchVectorVector();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let srcMat: any = null;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let dstMat: any = null;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let inliers: any = null;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let M: any = null;
     try {
       matcher2.knnMatch(cur.desc, reference.desc, knn, 2);
       const good: { q: number; t: number }[] = [];
@@ -312,11 +409,10 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
         srcPts.push(sp.x / cur.payload.preScale, sp.y / cur.payload.preScale);
         dstPts.push(dp.x / reference.payload.preScale, dp.y / reference.payload.preScale);
       }
-      srcMat = cv.matFromArray(srcPts.length / 2, 1, cv.CV_32FC2, srcPts);
-      dstMat = cv.matFromArray(dstPts.length / 2, 1, cv.CV_32FC2, dstPts);
-      inliers = new cv.Mat();
-      M = cv.estimateAffinePartial2D(srcMat, dstMat, inliers, cv.RANSAC, 3, 2000, 0.99);
-      if (!M || M.empty()) {
+
+      // Estimate similarity transform via custom RANSAC
+      const sim = estimateSimilarityRANSAC(srcPts, dstPts);
+      if (!sim) {
         results.push({
           slotIndex: cur.payload.slotIndex,
           status: 'failed',
@@ -324,10 +420,11 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
         });
         continue;
       }
-      const a = M.doubleAt(0, 0);
-      const b = M.doubleAt(0, 1);
-      const txImg = M.doubleAt(0, 2);
-      const tyImg = M.doubleAt(1, 2);
+
+      const a = sim.a;
+      const b = sim.b;
+      const txImg = sim.tx;
+      const tyImg = sim.ty;
       const scaleImg = Math.sqrt(a * a + b * b);
       const rotRad = Math.atan2(b, a);
       let rotDeg = (rotRad * 180) / Math.PI;
@@ -370,10 +467,6 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
     } finally {
       matcher2.delete();
       knn.delete();
-      srcMat?.delete?.();
-      dstMat?.delete?.();
-      inliers?.delete?.();
-      M?.delete?.();
     }
   }
 
