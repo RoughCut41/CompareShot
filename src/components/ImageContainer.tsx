@@ -47,6 +47,7 @@ export function ImageContainer({ state, slotIndex, onUpdate, onSetImage, onDelet
     async (files: FileList | File[] | null) => {
       if (!files || files.length === 0) return;
       const file = files[0];
+      console.log('[CompareShot] Loading file:', file.name, file.type, file.size);
       if (!file.type.startsWith('image/') && !/\.(heic|heif)$/i.test(file.name)) {
         setLoadError('Nur Bilddateien werden unterstützt.');
         return;
@@ -55,8 +56,10 @@ export function ImageContainer({ state, slotIndex, onUpdate, onSetImage, onDelet
       setLoadError(null);
       try {
         const newState = await loadImageFile(file);
+        console.log('[CompareShot] Image loaded:', newState.naturalWidth, '×', newState.naturalHeight);
         onSetImage(newState);
       } catch (err) {
+        console.error('[CompareShot] Image load failed:', err);
         setLoadError(err instanceof Error ? err.message : 'Laden fehlgeschlagen');
       } finally {
         setLoading(false);
@@ -181,7 +184,7 @@ export function ImageContainer({ state, slotIndex, onUpdate, onSetImage, onDelet
   return (
     <div
       ref={containerRef}
-      className="group relative flex-shrink-0 overflow-hidden rounded-lg border border-zinc-800 bg-black no-select"
+      className="group relative w-full overflow-hidden rounded-lg border border-zinc-800 bg-black no-select"
       style={{ aspectRatio: '960 / 1625' }}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
