@@ -124,43 +124,44 @@ function detectAtMultipleScales(
   landmarker: FaceLandmarker,
   img: HTMLImageElement
 ): RawDetection[] {
-  // MediaPipe handles input scaling internally, but on extremely large images
-  // a manual pre-scale to ~1600 px helps detection latency without hurting
-  // accuracy. We run two scales: 1600 and 2400.
-  const scales = [1600, 2400];
-
+  // MediaPipe handles scaling internally and works best with the image as-is.
+  // We pass the HTMLImageElement directly. If detection fails, we'll log
+  // diagnostic info so we can see what's happening.
   const all: RawDetection[] = [];
-  for (const maxDim of scales) {
-    const { canvas, scale } = renderToScale(img, maxDim);
-    try {
-      const result = landmarker.detect(canvas);
-      if (!result.faceLandmarks || result.faceLandmarks.length === 0) continue;
-      for (const face of result.faceLandmarks) {
-        // MediaPipe normalizes coordinates to [0, 1] — convert to source-image px
-        const lms = face.map((p: NormalizedLandmark) => ({
-          x: (p.x * canvas.width) / scale,
-          y: (p.y * canvas.height) / scale,
-        }));
-        // Compute bounding box from landmarks
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const p of lms) {
-          if (p.x < minX) minX = p.x;
-          if (p.y < minY) minY = p.y;
-          if (p.x > maxX) maxX = p.x;
-          if (p.y > maxY) maxY = p.y;
-        }
-        const w = maxX - minX;
-        const h = maxY - minY;
-        const score = (w * h) / (img.naturalWidth * img.naturalHeight);
-        all.push({
-          landmarks: lms,
-          box: { x: minX, y: minY, w, h },
-          score,
-        });
-      }
-    } catch (err) {
-      console.warn('[CompareShot] MediaPipe detection failed at scale', maxDim, err);
+  try {
+    console.log('[CompareShot] MediaPipe detect on', img.naturalWidth, '×', img.naturalHeight);
+    const result = landmarker.detect(img);
+    console.log('[CompareShot] MediaPipe result:', {
+      hasResult: !!result,
+      faceLandmarksCount: result?.faceLandmarks?.length ?? 0,
+    });
+    if (!result.faceLandmarks || result.faceLandmarks.length === 0) {
+      return all;
     }
+    for (const face of result.faceLandmarks) {
+      // MediaPipe returns normalized [0, 1] coordinates — multiply by image size
+      const lms = face.map((p: NormalizedLandmark) => ({
+        x: p.x * img.naturalWidth,
+        y: p.y * img.naturalHeight,
+      }));
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of lms) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+      const w = maxX - minX;
+      const h = maxY - minY;
+      const score = (w * h) / (img.naturalWidth * img.naturalHeight);
+      all.push({
+        landmarks: lms,
+        box: { x: minX, y: minY, w, h },
+        score,
+      });
+    }
+  } catch (err) {
+    console.warn('[CompareShot] MediaPipe detection failed:', err);
   }
   return all;
 }
