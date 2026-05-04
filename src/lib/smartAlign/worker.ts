@@ -450,15 +450,43 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
       const mappedY = b * cxCur + a * cyCur + tyImg;
       const refCxImg = reference.payload.naturalWidth / 2;
       const refCyImg = reference.payload.naturalHeight / 2;
-      const panX = (mappedX - refCxImg) * refCover;
-      const panY = (mappedY - refCyImg) * refCover;
-      const clampedZoom = Math.max(0.2, Math.min(5, zoom));
+      let panX = (mappedX - refCxImg) * refCover;
+      let panY = (mappedY - refCyImg) * refCover;
+      let finalZoom = Math.max(0.2, Math.min(5, zoom));
+
+      // "Auto-fill": bump up the zoom so that no black borders are visible.
+      // At zoom Z, the displayed image extends Z * containerW/2 from the rendered
+      // center horizontally (and same for vertical with containerH/2). After
+      // applying pan, the visible-without-black-border condition is:
+      //   |panX| + containerW/2 <= Z * containerW/2
+      //   |panY| + containerH/2 <= Z * containerH/2
+      // so Z must be at least max(1 + 2|panX|/cw, 1 + 2|panY|/ch).
+      // We also have to consider rotation — rotating expands the bounding box by
+      // roughly |cos| + |sin| in each axis, so we add a small safety margin.
+      const cw = cur.payload.containerW > 0 ? cur.payload.containerW : 960;
+      const ch = cur.payload.containerH > 0 ? cur.payload.containerH : 1625;
+      const rotRadAbs = Math.abs((rotDeg * Math.PI) / 180);
+      const rotExpand = Math.abs(Math.cos(rotRadAbs)) + Math.abs(Math.sin(rotRadAbs));
+      const minZoomX = (1 + (2 * Math.abs(panX)) / cw) * rotExpand;
+      const minZoomY = (1 + (2 * Math.abs(panY)) / ch) * rotExpand;
+      const minZoom = Math.max(minZoomX, minZoomY);
+      if (finalZoom < minZoom) {
+        // Scale up: we want to multiply zoom by k = minZoom/finalZoom. To keep the
+        // *content* aligned (the feature points still landing at the same on-screen
+        // position), we also scale pan by k.
+        const k = minZoom / finalZoom;
+        finalZoom = minZoom;
+        panX *= k;
+        panY *= k;
+      }
+      // Re-clamp in case minZoom was extreme (very large pan)
+      finalZoom = Math.min(finalZoom, 5);
 
       results.push({
         slotIndex: cur.payload.slotIndex,
         status: 'aligned',
         transform: {
-          zoom: clampedZoom,
+          zoom: finalZoom,
           panX,
           panY,
           rotation: rotDeg,
