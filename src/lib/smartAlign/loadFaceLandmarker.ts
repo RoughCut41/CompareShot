@@ -28,7 +28,7 @@ export async function loadFaceLandmarker(): Promise<FaceLandmarker> {
       baseOptions: {
         modelAssetPath: MODEL_URL,
         // CPU is more reliable across browsers; GPU sometimes fails on Safari
-        delegate: 'CPU',
+        delegate: 'GPU',
       },
       runningMode: 'IMAGE',
       numFaces: 5,
