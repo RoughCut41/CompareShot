@@ -2,13 +2,15 @@
  * Face-based Smart Align using face-api.js (Tiny Face Detector + 68 Landmarks).
  *
  * Strategy:
- *  - Detect ALL faces at MULTIPLE input scales — this catches small faces in
- *    landscape-oriented smartphone shots that a single-scale pass would miss.
- *  - For each image, pick the LARGEST face (closest person) as the anchor.
- *  - From the 68 landmarks + detection box, extract the head bounding box:
- *    top-of-head from the box top, chin from landmark 8.
- *  - Pick the reference image via head size + sharpness + confidence.
- *  - Align by matching head height (zoom) and head center (pan). No rotation.
+ *  - Detect faces at multiple scales for sensitivity on small faces.
+ *  - Pick the largest face per image (closest person).
+ *  - Use stable landmark-based metrics:
+ *      head size  = eye midpoint → chin distance
+ *      anchor     = eye midpoint
+ *    These are geometrically consistent across detections, unlike the
+ *    detection bounding box which fluctuates with lighting / hair / confidence.
+ *  - Align all images so that eye midpoints land at the same on-screen
+ *    position and eye-to-chin distance matches the reference.
  *  - Auto-fill: bump zoom so no black borders appear.
  */
 import { decodeImage } from '@/lib/exportRenderer';
@@ -25,8 +27,10 @@ import {
 interface FaceData {
   slotIndex: number;
   img: HTMLImageElement;
+  /** Eye midpoint in image pixels — translation anchor */
   headCenterX: number;
   headCenterY: number;
+  /** Eye-to-chin distance in image pixels — used for scale matching */
   headHeight: number;
   detectionScore: number;
   sharpness: number;
@@ -36,6 +40,15 @@ function computeCoverScale(naturalW: number, naturalH: number, containerW: numbe
   const cw = containerW > 0 ? containerW : 960;
   const ch = containerH > 0 ? containerH : 1625;
   return Math.max(cw / naturalW, ch / naturalH);
+}
+
+function avgLandmarks(lm: { x: number; y: number }[], indices: number[]): { x: number; y: number } {
+  let x = 0, y = 0;
+  for (const i of indices) {
+    x += lm[i].x;
+    y += lm[i].y;
+  }
+  return { x: x / indices.length, y: y / indices.length };
 }
 
 async function imageSharpness(img: HTMLImageElement, maxDim = 400): Promise<number> {
@@ -80,10 +93,6 @@ function normalize(values: number[]): number[] {
 
 // -------- Detection at multiple scales --------
 
-/**
- * Render the source image to a canvas at the requested target maximum dimension.
- * Returns the canvas plus the scale factor (display→original).
- */
 function renderToScale(img: HTMLImageElement, maxDim: number): { canvas: HTMLCanvasElement; scale: number } {
   const ratio = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
   const w = Math.max(1, Math.round(img.naturalWidth * ratio));
@@ -97,23 +106,11 @@ function renderToScale(img: HTMLImageElement, maxDim: number): { canvas: HTMLCan
 }
 
 interface RawDetection {
-  /** Bounding box in original image pixels */
   box: { x: number; y: number; w: number; h: number };
-  /** All 68 landmarks in original image pixels */
   landmarks: { x: number; y: number }[];
   score: number;
 }
 
-/**
- * Detect faces using face-api at multiple input scales, then merge.
- *
- * The Tiny Face Detector internally resizes the input to a square inputSize.
- * If the original image is much larger than inputSize, faces in the image
- * shrink below the detector's minimum face size (~20px). To avoid that we
- * render the source image at three target sizes: 1024, 1600, and 2400 pixels
- * on the longer edge. Each scale uses inputSize that closely matches its
- * canvas, so faces stay at ~detector-friendly sizes.
- */
 async function detectAtMultipleScales(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   faceapi: any,
@@ -159,14 +156,12 @@ async function detectAtMultipleScales(
   return all;
 }
 
-/** Suppress duplicates: if two detections overlap heavily, keep only the higher-scoring one. */
 function dedupeDetections(dets: RawDetection[]): RawDetection[] {
   const sorted = dets.slice().sort((a, b) => b.score - a.score);
   const kept: RawDetection[] = [];
   for (const d of sorted) {
     let dup = false;
     for (const k of kept) {
-      // IoU
       const x1 = Math.max(d.box.x, k.box.x);
       const y1 = Math.max(d.box.y, k.box.y);
       const x2 = Math.min(d.box.x + d.box.w, k.box.x + k.box.w);
@@ -218,15 +213,30 @@ export async function detectFacesForSlots(
       }
 
       const lm = best.landmarks;
-      const headTop = best.box.y;
-      const chinY = lm[8].y;
-      const headHeight = Math.max(1, chinY - headTop);
 
-      let cx = 0;
-      for (const p of lm) cx += p.x;
-      cx /= lm.length;
-      const headCenterX = cx;
-      const headCenterY = (headTop + chinY) / 2;
+      // Stable face metrics — based on landmark positions only, not the detection
+      // box (which fluctuates depending on the detector's confidence and lighting).
+      //
+      // Eye centers: average of left eye landmarks (36..41) and right eye (42..47).
+      // These are extremely consistent across detections of the same face.
+      const leftEyeCenter = avgLandmarks(lm, [36, 37, 38, 39, 40, 41]);
+      const rightEyeCenter = avgLandmarks(lm, [42, 43, 44, 45, 46, 47]);
+      const eyeMidX = (leftEyeCenter.x + rightEyeCenter.x) / 2;
+      const eyeMidY = (leftEyeCenter.y + rightEyeCenter.y) / 2;
+      // Chin tip: landmark 8 (very stable)
+      const chinX = lm[8].x;
+      const chinY = lm[8].y;
+
+      // Use eye-to-chin distance as our "head size" metric. This is geometrically
+      // stable across detections — unlike the detection box which can include
+      // varying amounts of hair.
+      const eyeToChin = Math.sqrt((chinX - eyeMidX) ** 2 + (chinY - eyeMidY) ** 2);
+      const headHeight = Math.max(1, eyeToChin);
+
+      // Anchor point for translation: the eye midpoint. Aligning eyes is what
+      // the human visual system perceives as "lined up".
+      const headCenterX = eyeMidX;
+      const headCenterY = eyeMidY;
 
       const sharpness = await imageSharpness(img);
 
