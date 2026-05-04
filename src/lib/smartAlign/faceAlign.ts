@@ -94,18 +94,6 @@ function normalize(values: number[]): number[] {
 
 // -------- Detection at multiple scales --------
 
-function renderToScale(img: HTMLImageElement, maxDim: number): { canvas: HTMLCanvasElement; scale: number } {
-  const ratio = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
-  const w = Math.max(1, Math.round(img.naturalWidth * ratio));
-  const h = Math.max(1, Math.round(img.naturalHeight * ratio));
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d')!;
-  ctx.drawImage(img, 0, 0, w, h);
-  return { canvas, scale: ratio };
-}
-
 interface RawDetection {
   /** All 478 landmarks, scaled back to original image pixels */
   landmarks: { x: number; y: number }[];
