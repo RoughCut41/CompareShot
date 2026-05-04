@@ -2,20 +2,21 @@
  * Face-based Smart Align using face-api.js (Tiny Face Detector + 68 Landmarks).
  *
  * Strategy:
- *  - Detect the largest face in every input image
- *  - From the 68 landmarks, extract:
- *      • inter-ocular distance (eye-to-eye, in image pixels)
- *      • nose tip position (image pixels)
- *  - Score each image: sharpness (Laplacian via Canvas), face area (proxy
- *    for centrality / closeness), and face-detection confidence.
- *  - Pick the highest-scoring image as the reference.
- *  - For every other image, compute a transform that:
- *      • scales so the eye-to-eye distance matches the reference
- *      • translates so the nose tip lands at the reference's nose tip
- *      • applies no rotation (face landmarks are noisy enough that rotating
- *        based on them often makes things worse — users can rotate manually)
- *  - The final transform is converted to container-pixel form, identical to
- *    the feature pipeline.
+ *  - Detect ALL faces in every input image (more sensitive settings than
+ *    detectSingleFace, so small faces like in smartphone landscape shots get
+ *    caught)
+ *  - For each image, pick the LARGEST face (closest person) as the anchor
+ *  - From the 68 landmarks, extract the head bounding box: top-of-head from
+ *    the detection box top, chin from landmark 8 (jaw bottom), face-center
+ *    from the average of all landmarks
+ *  - Score each image: sharpness + head size (proxy for centrality / closeness)
+ *    + detection confidence. Pick the highest as the reference.
+ *  - For every other image: scale so that head height matches reference, and
+ *    translate so that the head center lands at the reference's head center.
+ *  - No rotation (landmarks are too noisy for stable rotation estimation).
+ *  - Apply auto-fill so no black borders appear.
+ *  - For images WHERE NO FACE WAS DETECTED, return null transform — caller
+ *    falls back to feature alignment for those slots.
  */
 import { decodeImage } from '@/lib/exportRenderer';
 import { ImageState } from '@/lib/types';
@@ -31,11 +32,14 @@ import {
 interface FaceData {
   slotIndex: number;
   img: HTMLImageElement;
-  noseX: number; // image px
-  noseY: number;
-  eyeDistance: number; // image px
-  faceArea: number; // image px²
+  /** Center of the head (image px) — used for translation alignment */
+  headCenterX: number;
+  headCenterY: number;
+  /** Head height in image pixels — distance from top-of-head to chin */
+  headHeight: number;
+  /** Detection score (0..1) */
   detectionScore: number;
+  /** Sharpness proxy (relative ordering only) */
   sharpness: number;
 }
 
@@ -46,9 +50,8 @@ function computeCoverScale(naturalW: number, naturalH: number, containerW: numbe
 }
 
 /**
- * Compute Laplacian-style variance of an image via a quick canvas-based
- * 3x3 Laplacian convolution on a downsampled grayscale version. Used as a
- * sharpness proxy; absolute value isn't important, only relative ordering.
+ * Quick Laplacian-style sharpness on a downsampled grayscale image. Used only
+ * for relative comparison between images — absolute value is meaningless.
  */
 async function imageSharpness(img: HTMLImageElement, maxDim = 400): Promise<number> {
   const ratio = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
@@ -61,13 +64,11 @@ async function imageSharpness(img: HTMLImageElement, maxDim = 400): Promise<numb
   ctx.drawImage(img, 0, 0, w, h);
   const data = ctx.getImageData(0, 0, w, h).data;
 
-  // grayscale
   const gray = new Float32Array(w * h);
   for (let i = 0, p = 0; i < data.length; i += 4, p++) {
     gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
   }
 
-  // Laplacian via 4-neighbor kernel on inner pixels
   let sum = 0;
   let sumSq = 0;
   let n = 0;
@@ -94,49 +95,91 @@ function normalize(values: number[]): number[] {
 
 // -------- Detection --------
 
-async function detectFaces(slots: AlignableSlot[]): Promise<(FaceData | null)[]> {
+/**
+ * Detect faces in all input images. Returns null for slots where no face is
+ * found (caller decides what to do).
+ *
+ * Uses detectAllFaces (instead of detectSingleFace) with a sensitive
+ * configuration: lower scoreThreshold and a larger inputSize, so smaller
+ * faces (typical for smartphone landscape shots) are still detected. From
+ * the resulting list we pick the largest face per image (closest person).
+ */
+export async function detectFacesForSlots(
+  slots: AlignableSlot[],
+  onProgress?: ProgressCallback
+): Promise<(FaceData | null)[]> {
+  onProgress?.('Loading face models…');
   const faceapi = await loadFaceApi();
+
+  onProgress?.('Detecting faces…');
   const detectorOptions = new faceapi.TinyFaceDetectorOptions({
-    inputSize: 416,
-    scoreThreshold: 0.5,
+    inputSize: 608, // higher resolution → small faces still get detected
+    scoreThreshold: 0.3, // lower threshold → more sensitive
   });
 
   const results: (FaceData | null)[] = [];
   for (const slot of slots) {
     const img = await decodeImage(slot.state.url);
     try {
-      const detection = await faceapi
-        .detectSingleFace(img, detectorOptions)
-        .withFaceLandmarks();
+      // detectAllFaces returns every face; we then pick the largest.
+      const detections = await faceapi.detectAllFaces(img, detectorOptions).withFaceLandmarks();
 
-      if (!detection) {
+      if (!detections || detections.length === 0) {
         results.push(null);
         continue;
       }
 
-      // 68-point landmark indices (face-api.js convention):
-      //   left eye:  36..41   right eye: 42..47
-      //   nose tip:  30
-      const lm = detection.landmarks.positions;
-      const leftEye = avgPoint(lm, [36, 37, 38, 39, 40, 41]);
-      const rightEye = avgPoint(lm, [42, 43, 44, 45, 46, 47]);
-      const nose = lm[30];
-      const eyeDx = rightEye.x - leftEye.x;
-      const eyeDy = rightEye.y - leftEye.y;
-      const eyeDistance = Math.sqrt(eyeDx * eyeDx + eyeDy * eyeDy);
+      // Pick the face with the largest bounding box (closest person)
+      let largest = detections[0];
+      let largestArea = largest.detection.box.width * largest.detection.box.height;
+      for (let i = 1; i < detections.length; i++) {
+        const d = detections[i];
+        const area = d.detection.box.width * d.detection.box.height;
+        if (area > largestArea) {
+          largest = d;
+          largestArea = area;
+        }
+      }
 
-      const box = detection.detection.box;
-      const faceArea = box.width * box.height;
+      // Extract head geometry
+      const lm = largest.landmarks.positions;
+      const box = largest.detection.box;
+
+      // Top-of-head: use the detection box top edge (face-api's box covers the
+      // visible head reasonably well; landmarks alone don't include hair).
+      const headTop = box.top;
+
+      // Chin: landmark 8 is the bottom of the jaw
+      const chinY = lm[8].y;
+
+      // Head height: from top of detection box to chin
+      const headHeight = Math.max(1, chinY - headTop);
+
+      // Head center: average of all 68 landmark positions for stability
+      let cx = 0;
+      let cy = 0;
+      for (const p of lm) {
+        cx += p.x;
+        cy += p.y;
+      }
+      cx /= lm.length;
+      cy /= lm.length;
+
+      // We want the head center to be vertically at the midpoint between top-of-head
+      // and chin, not at the landmark centroid (which leans toward the lower face).
+      // Use the geometric vertical midpoint of the head.
+      const headCenterY = (headTop + chinY) / 2;
+      const headCenterX = cx; // horizontal midpoint from landmarks is fine
+
       const sharpness = await imageSharpness(img);
 
       results.push({
         slotIndex: slot.slotIndex,
         img,
-        noseX: nose.x,
-        noseY: nose.y,
-        eyeDistance,
-        faceArea,
-        detectionScore: detection.detection.score,
+        headCenterX,
+        headCenterY,
+        headHeight,
+        detectionScore: largest.detection.score,
         sharpness,
       });
     } catch {
@@ -146,25 +189,17 @@ async function detectFaces(slots: AlignableSlot[]): Promise<(FaceData | null)[]>
   return results;
 }
 
-function avgPoint(points: { x: number; y: number }[], indices: number[]) {
-  let sx = 0;
-  let sy = 0;
-  for (const i of indices) {
-    sx += points[i].x;
-    sy += points[i].y;
-  }
-  return { x: sx / indices.length, y: sy / indices.length };
-}
-
 // -------- Reference selection --------
 
 function pickFaceReference(faces: FaceData[]): number {
   if (faces.length === 0) return 0;
   const sN = normalize(faces.map((f) => f.sharpness));
-  const aN = normalize(faces.map((f) => f.faceArea));
+  // Use head height (in image pixels) as the proxy for closeness/centrality —
+  // a closer person has a larger head.
+  const hN = normalize(faces.map((f) => f.headHeight));
   const dN = normalize(faces.map((f) => f.detectionScore));
-  // Sharpness 30, face area (≈ centrality/closeness) 55, detection confidence 15
-  const scores = faces.map((_, i) => 0.3 * sN[i] + 0.55 * aN[i] + 0.15 * dN[i]);
+  // Weights: closeness (head size) most important, then sharpness, then confidence.
+  const scores = faces.map((_, i) => 0.55 * hN[i] + 0.3 * sN[i] + 0.15 * dN[i]);
   let best = 0;
   for (let i = 1; i < scores.length; i++) {
     if (scores[i] > scores[best]) best = i;
@@ -180,9 +215,9 @@ function faceDataToTransform(
   currentState: ImageState,
   referenceState: ImageState
 ): AlignTransform {
-  // Image-pixel scale to apply: makes current's eye distance match reference's
-  // (in their respective image-pixel spaces).
-  const imageScale = reference.eyeDistance / Math.max(1, current.eyeDistance);
+  // Image-pixel scale to apply: makes the current head height equal the
+  // reference head height (in their respective image-pixel spaces).
+  const imageScale = reference.headHeight / Math.max(1, current.headHeight);
 
   // Cover scales for the on-screen rendering
   const refCover = computeCoverScale(
@@ -201,62 +236,67 @@ function faceDataToTransform(
   // Final on-screen zoom multiplier (relative to current's natural cover-fit)
   const zoom = (refCover * imageScale) / curCover;
 
-  // We want: when current is rendered with this zoom and a translation,
-  // its nose tip ends up at the same on-screen position as the reference's
-  // nose tip (which is just centered in the reference container plus an
-  // offset from its natural center).
-  //
-  // Reference nose offset from its natural center, expressed in reference-
-  // container pixels:
-  const refNoseOffsetX_refImg = reference.noseX - referenceState.naturalWidth / 2;
-  const refNoseOffsetY_refImg = reference.noseY - referenceState.naturalHeight / 2;
-  const refNoseOffsetX_refContainer = refNoseOffsetX_refImg * refCover;
-  const refNoseOffsetY_refContainer = refNoseOffsetY_refImg * refCover;
+  // Reference head-center offset from its natural center, in reference-container px:
+  const refOffsetX_refImg = reference.headCenterX - referenceState.naturalWidth / 2;
+  const refOffsetY_refImg = reference.headCenterY - referenceState.naturalHeight / 2;
+  const refOffsetX_container = refOffsetX_refImg * refCover;
+  const refOffsetY_container = refOffsetY_refImg * refCover;
 
-  // Current nose offset from its natural center, in current image pixels.
-  // After we apply zoom on top of cover, this offset projected onto the
-  // current container becomes: offset * curCover * zoom = offset * refCover * imageScale.
-  const curNoseOffsetX_curImg = current.noseX - currentState.naturalWidth / 2;
-  const curNoseOffsetY_curImg = current.noseY - currentState.naturalHeight / 2;
-  const curNoseProjectedX = curNoseOffsetX_curImg * refCover * imageScale;
-  const curNoseProjectedY = curNoseOffsetY_curImg * refCover * imageScale;
+  // Current head-center offset from its natural center, in current image px.
+  // After applying zoom on top of cover, this projects onto the container as
+  //   offset * curCover * zoom = offset * refCover * imageScale.
+  const curOffsetX_curImg = current.headCenterX - currentState.naturalWidth / 2;
+  const curOffsetY_curImg = current.headCenterY - currentState.naturalHeight / 2;
+  const curProjectedX = curOffsetX_curImg * refCover * imageScale;
+  const curProjectedY = curOffsetY_curImg * refCover * imageScale;
 
-  // To align the noses, panX must shift the projected current nose to the
-  // reference nose location:
-  const panX = refNoseOffsetX_refContainer - curNoseProjectedX;
-  const panY = refNoseOffsetY_refContainer - curNoseProjectedY;
+  // To align the head centers, panX must shift the projected current head to
+  // the reference head location:
+  let panX = refOffsetX_container - curProjectedX;
+  let panY = refOffsetY_container - curProjectedY;
 
-  const clampedZoom = Math.max(0.2, Math.min(5, zoom));
-  return { zoom: clampedZoom, panX, panY, rotation: 0 };
+  let finalZoom = Math.max(0.2, Math.min(5, zoom));
+
+  // Auto-fill: bump zoom so no black borders appear after pan + rotation (no rotation here).
+  const cw = currentState._containerW > 0 ? currentState._containerW : 960;
+  const ch = currentState._containerH > 0 ? currentState._containerH : 1625;
+  const minZoomX = 1 + (2 * Math.abs(panX)) / cw;
+  const minZoomY = 1 + (2 * Math.abs(panY)) / ch;
+  const minZoom = Math.max(minZoomX, minZoomY);
+  if (finalZoom < minZoom) {
+    const k = minZoom / finalZoom;
+    finalZoom = minZoom;
+    panX *= k;
+    panY *= k;
+  }
+  finalZoom = Math.min(finalZoom, 5);
+
+  return { zoom: finalZoom, panX, panY, rotation: 0 };
 }
 
 // -------- Public entry point --------
 
+/**
+ * Align using face-api results. Slots without a detected face return a
+ * 'no-face' result so the caller can choose to feature-align them as a fallback.
+ */
 export async function faceAlign(
   slots: AlignableSlot[],
   detected: (FaceData | null)[],
   onProgress?: ProgressCallback
 ): Promise<SmartAlignReport> {
-  // Filter to slots that actually have a detected face
   const withFaces: FaceData[] = [];
-  const indexInWithFaces = new Map<number, number>(); // slotIndex → position in withFaces
-  for (let i = 0; i < slots.length; i++) {
-    const f = detected[i];
-    if (f) {
-      indexInWithFaces.set(slots[i].slotIndex, withFaces.length);
-      withFaces.push(f);
-    }
+  for (const f of detected) {
+    if (f) withFaces.push(f);
   }
 
-  if (withFaces.length < 2) {
-    // Fall back: caller will likely retry with feature align — but for safety,
-    // mark everything skipped.
+  if (withFaces.length === 0) {
     return {
       mode: 'face',
       referenceSlotIndex: slots[0]?.slotIndex ?? 0,
       results: slots.map((s) => ({
         slotIndex: s.slotIndex,
-        status: 'skipped',
+        status: 'failed',
         reason: 'No face detected',
       })),
     };
@@ -266,8 +306,6 @@ export async function faceAlign(
   const refLocal = pickFaceReference(withFaces);
   const reference = withFaces[refLocal];
   const referenceSlotIndex = reference.slotIndex;
-
-  // Find reference state
   const refState = slots.find((s) => s.slotIndex === referenceSlotIndex)!.state;
 
   const results: AlignResult[] = [];
@@ -279,10 +317,12 @@ export async function faceAlign(
     }
     const face = detected[i];
     if (!face) {
+      // Mark for caller-driven fallback. The caller (smartAlign in index.ts)
+      // will detect this status and run feature alignment for this slot.
       results.push({
         slotIndex: slot.slotIndex,
         status: 'failed',
-        reason: 'No face detected',
+        reason: 'No face detected — will fall back to features',
       });
       continue;
     }
@@ -302,12 +342,5 @@ export async function faceAlign(
   };
 }
 
-export async function detectFacesForSlots(
-  slots: AlignableSlot[],
-  onProgress?: ProgressCallback
-): Promise<(FaceData | null)[]> {
-  onProgress?.('Loading face models…');
-  await loadFaceApi();
-  onProgress?.('Detecting faces…');
-  return detectFaces(slots);
-}
+// Re-export FaceData type for use in detection
+export type { FaceData };
