@@ -50,10 +50,7 @@ export const EXPORT_ASPECT = EXPORT_WIDTH / EXPORT_HEIGHT;
 
 export const SLOT_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'] as const;
 
-export const DEFAULT_IMAGE_STATE: Omit
-  ImageState,
-  'file' | 'url' | 'naturalWidth' | 'naturalHeight'
-> = {
+export const DEFAULT_IMAGE_STATE = {
   zoom: 1,
   panX: 0,
   panY: 0,
