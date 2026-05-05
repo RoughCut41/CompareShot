@@ -7,6 +7,8 @@
  *  - Use multiple anatomical distances combined via median for a robust
  *    scale metric. This avoids over-correcting when a single distance
  *    happens to be off due to pose variation.
+ *  - Normalize the scale by the image's longer edge so cameras with
+ *    different sensor resolutions can be compared directly.
  *  - Auto-fill: bump zoom so no black borders appear.
  */
 import type { Tensor } from 'onnxruntime-web';
@@ -43,7 +45,10 @@ interface PoseData {
   /** Translation anchor in original image pixels */
   anchorX: number;
   anchorY: number;
-  /** Scale metric in original image pixels — robust median of multiple anatomical distances */
+  /**
+   * Scale metric NORMALIZED by the image's longer edge — directly comparable
+   * across images of different sensor resolutions. Values are typically 0.05..0.5.
+   */
   anchorScale: number;
   /** Which anchor strategy was used (for diagnostics) */
   anchorMode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
@@ -105,10 +110,6 @@ interface PreprocessedImage {
   padY: number;
 }
 
-/**
- * Preprocess image for YOLO11: letterbox to 640×640 maintaining aspect ratio,
- * normalize to 0..1, transpose to NCHW.
- */
 function preprocess(img: HTMLImageElement): PreprocessedImage {
   const W = img.naturalWidth;
   const H = img.naturalHeight;
@@ -230,6 +231,7 @@ function extractAnchor(
 ): {
   anchorX: number;
   anchorY: number;
+  /** Raw anchor scale in image pixels (will be normalized by caller) */
   anchorScale: number;
   mode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
 } | null {
@@ -258,16 +260,13 @@ function extractAnchor(
     return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
   }
 
-  // Best case: enough keypoints visible to combine multiple distance measures.
-  // Each measure has a different anatomical "weight". To make them comparable
-  // we normalize them to a common reference: "eye-to-shoulder" units.
-  // Typical human anatomical ratios (approximate, COCO-trained averages):
+  // Best case: combine multiple anatomical distance measures for a robust scale.
+  // Each measure is normalized to "eye-to-shoulder units" using approximate ratios:
   //   shoulder-width       ≈ 1.5 × eye-to-shoulder
   //   eye-to-eye           ≈ 0.4 × eye-to-shoulder
   //   nose-to-shoulder-mid ≈ 0.85 × eye-to-shoulder
   //   eye-to-hip-mid       ≈ 3.5 × eye-to-shoulder
-  // We compute each available measure, divide by its expected ratio, and
-  // take the MEDIAN. Outliers (e.g. one mis-detected keypoint) are absorbed.
+  // Then take the MEDIAN — outliers (mis-detected keypoints) get absorbed.
   if (eyesGood && shouldersGood) {
     const eyeMidX = (lEye.x + rEye.x) / 2;
     const eyeMidY = (lEye.y + rEye.y) / 2;
@@ -275,7 +274,6 @@ function extractAnchor(
     const shMidY = (lSh.y + rSh.y) / 2;
 
     const measures: number[] = [];
-    // Each measure is normalized to "eye-to-shoulder" units.
     measures.push(dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY })); // 1.0×
     measures.push(dist(lSh, rSh) / 1.5);
     measures.push(dist(lEye, rEye) / 0.4);
@@ -298,7 +296,6 @@ function extractAnchor(
     };
   }
 
-  // Fallback: only shoulders confident → shoulder anchor + shoulder-to-shoulder distance
   if (shouldersGood) {
     const shMidX = (lSh.x + rSh.x) / 2;
     const shMidY = (lSh.y + rSh.y) / 2;
@@ -311,7 +308,6 @@ function extractAnchor(
     };
   }
 
-  // Last resort: only eyes confident → eye-to-eye distance as scale
   if (eyesGood) {
     const eyeMidX = (lEye.x + rEye.x) / 2;
     const eyeMidY = (lEye.y + rEye.y) / 2;
@@ -379,7 +375,20 @@ export async function detectPoseForSlots(
         results.push(null);
         continue;
       }
-      console.log('[CompareShot] Slot', slot.slotIndex, '— mode:', anchor.mode, 'scale:', anchor.anchorScale.toFixed(1));
+
+      // Normalize the scale by the image's longer edge so it's directly
+      // comparable across cameras with different sensor resolutions.
+      // Without this, a 4284px-wide iPhone photo would yield a 40% larger
+      // anchorScale than a 3000px Android photo of the same scene.
+      const imageDim = Math.max(img.naturalWidth, img.naturalHeight);
+      const normalizedScale = anchor.anchorScale / imageDim;
+
+      console.log(
+        '[CompareShot] Slot', slot.slotIndex,
+        '— mode:', anchor.mode,
+        'rawScale:', anchor.anchorScale.toFixed(1),
+        'normScale:', normalizedScale.toFixed(4)
+      );
 
       const sharpness = await imageSharpness(img);
 
@@ -387,7 +396,7 @@ export async function detectPoseForSlots(
         slotIndex: slot.slotIndex,
         anchorX: anchor.anchorX,
         anchorY: anchor.anchorY,
-        anchorScale: anchor.anchorScale,
+        anchorScale: normalizedScale,
         anchorMode: anchor.mode,
         detectionScore: best.score,
         sharpness,
@@ -423,7 +432,12 @@ function poseToTransform(
   currentState: ImageState,
   referenceState: ImageState
 ): AlignTransform {
-  const imageScale = reference.anchorScale / Math.max(1, current.anchorScale);
+  // anchorScale is normalized (anchor-distance / longer-image-edge), so a
+  // direct ratio gives the correct relative-size scaling factor.
+  // Example: if both anchorScales are 0.10, the person occupies the same
+  // fraction of each image, so imageScale = 1 (no zoom needed). If current
+  // is 0.05 and reference is 0.10, current must be 2× zoomed to match.
+  const imageScale = reference.anchorScale / Math.max(1e-6, current.anchorScale);
 
   const refCover = computeCoverScale(
     referenceState.naturalWidth,
@@ -455,7 +469,6 @@ function poseToTransform(
 
   let finalZoom = Math.max(0.2, Math.min(5, zoom));
 
-  // Auto-fill against black borders
   const cw = currentState._containerW > 0 ? currentState._containerW : 960;
   const ch = currentState._containerH > 0 ? currentState._containerH : 1625;
   const minZoomX = 1 + (2 * Math.abs(panX)) / cw;
