@@ -27,5 +27,4 @@ yarn-error.log*
 .vercel/
 
 # Auto-downloaded models and runtime files (fetched at build time)
-public/models/
 public/ort/
