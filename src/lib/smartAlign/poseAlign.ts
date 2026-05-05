@@ -21,7 +21,6 @@ import { loadOrt } from './loadOrt';
 import { loadYoloPose, KP } from './loadYoloPose';
 import {
   AlignResult,
-  AlignTransform,
   AlignableSlot,
   ProgressCallback,
   SmartAlignReport,
@@ -290,21 +289,16 @@ function pickReference(poses: PoseData[]): number {
 // ----- Per-image computed values used by the global solver -----
 
 interface SlotCalc {
-  poseIdx: number;          // index into withPose array
+  poseIdx: number;
   slotIndex: number;
   state: ImageState;
   pose: PoseData;
   cover: number;
-  scaleMatchZoom: number;   // multiplier needed for this image's head to match target size
+  scaleMatchZoom: number;
   containerW: number;
   containerH: number;
 }
 
-/**
- * For a given globalCropZoom, compute each slot's feasible Y interval (where
- * the eye-anchor can land on the container without producing a black border).
- * Returns the intersection range across all slots (could be empty).
- */
 function computeFeasibleYInterval(
   calcs: SlotCalc[],
   globalCropZoom: number
@@ -324,21 +318,13 @@ function computeFeasibleYInterval(
   return { lo, hi, perSlot };
 }
 
-/**
- * Binary-search the smallest globalCropZoom in [1.0, MAX_GLOBAL_CROP] such
- * that all slots' Y-intervals overlap. Returns MAX_GLOBAL_CROP if no overlap
- * is achievable within the cap (caller will then accept Y-imperfection).
- */
 function solveGlobalCropZoom(calcs: SlotCalc[]): number {
-  // Already feasible at zoom 1?
   let { lo, hi } = computeFeasibleYInterval(calcs, 1.0);
   if (lo <= hi) return 1.0;
 
-  // Try the cap — if even at the cap we can't overlap, return cap (best effort)
   ({ lo, hi } = computeFeasibleYInterval(calcs, MAX_GLOBAL_CROP));
   if (lo > hi) return MAX_GLOBAL_CROP;
 
-  // Binary search
   let low = 1.0, high = MAX_GLOBAL_CROP;
   for (let iter = 0; iter < 24; iter++) {
     const mid = (low + high) / 2;
@@ -370,8 +356,6 @@ export async function poseAlign(
   const referenceSlotIndex = reference.slotIndex;
 
   // ---- Step 1: Compute scaleMatchZoom for each slot ----
-  // Target on-screen size = MEDIAN of all images' natural on-screen sizes.
-  // Median (not reference) is more robust against outliers.
   const calcs: SlotCalc[] = withPose.map((p, i) => {
     const slot = slots.find((s) => s.slotIndex === p.slotIndex)!;
     const cover = computeCoverScale(
@@ -386,7 +370,7 @@ export async function poseAlign(
       state: slot.state,
       pose: p,
       cover,
-      scaleMatchZoom: 1, // filled in below
+      scaleMatchZoom: 1,
       containerW: slot.state._containerW > 0 ? slot.state._containerW : 960,
       containerH: slot.state._containerH > 0 ? slot.state._containerH : 1625,
     };
@@ -415,7 +399,7 @@ export async function poseAlign(
 
   // ---- Step 3: Compute final Y target ----
   const { lo: globalLoY, hi: globalHiY, perSlot } = computeFeasibleYInterval(calcs, globalCropZoom);
-  const naturalEyeYs = calcs.map((c, i) => perSlot[i].baseY);
+  const naturalEyeYs = perSlot.map((s) => s.baseY);
   const preferredY = median(naturalEyeYs);
   const targetY = clamp(preferredY, globalLoY, globalHiY);
   const yIntervalEmpty = globalLoY > globalHiY;
@@ -426,8 +410,7 @@ export async function poseAlign(
     'targetY:', targetY.toFixed(1)
   );
 
-  // ---- Step 4: Compute final X target (lower priority — same approach but more lenient) ----
-  // For X we just use the median of natural anchor X positions, then clamp per-slot.
+  // ---- Step 4: Compute final X target (lower priority) ----
   const naturalEyeXs = calcs.map((c) => {
     const z = c.scaleMatchZoom * globalCropZoom;
     return (c.pose.anchorXNorm - 0.5) * c.pose.naturalWidth * c.cover * z;
@@ -448,16 +431,16 @@ export async function poseAlign(
       continue;
     }
     onProgress?.(`Aligning ${i + 1}/${slots.length}…`);
-    const c = calcs.find((x) => x.slotIndex === slot.slotIndex)!;
-    const idxInCalcs = calcs.indexOf(c);
+    const calc = calcs.find((x) => x.slotIndex === slot.slotIndex)!;
+    const idxInCalcs = calcs.indexOf(calc);
 
-    const finalZoom = c.scaleMatchZoom * globalCropZoom;
-    const drawnW = c.pose.naturalWidth * c.cover * finalZoom;
-    const drawnH = c.pose.naturalHeight * c.cover * finalZoom;
-    const reserveX = Math.max(0, (drawnW - c.containerW) / 2 - SAFETY_PX);
-    const reserveY = Math.max(0, (drawnH - c.containerH) / 2 - SAFETY_PX);
+    const finalZoom = calc.scaleMatchZoom * globalCropZoom;
+    const drawnW = calc.pose.naturalWidth * calc.cover * finalZoom;
+    const drawnH = calc.pose.naturalHeight * calc.cover * finalZoom;
+    const reserveX = Math.max(0, (drawnW - calc.containerW) / 2 - SAFETY_PX);
+    const reserveY = Math.max(0, (drawnH - calc.containerH) / 2 - SAFETY_PX);
 
-    const baseX = (c.pose.anchorXNorm - 0.5) * c.pose.naturalWidth * c.cover * finalZoom;
+    const baseX = (calc.pose.anchorXNorm - 0.5) * calc.pose.naturalWidth * calc.cover * finalZoom;
     const baseY = perSlot[idxInCalcs].baseY;
 
     let panX = targetX - baseX;
@@ -469,7 +452,7 @@ export async function poseAlign(
     console.log(
       '[CompareShot] Transform slot', slot.slotIndex,
       'finalZoom:', finalZoom.toFixed(3),
-      '(scaleMatch:', c.scaleMatchZoom.toFixed(3), '× globalCrop:', globalCropZoom.toFixed(3) + ')',
+      '(scaleMatch:', calc.scaleMatchZoom.toFixed(3), '× globalCrop:', globalCropZoom.toFixed(3) + ')',
       'panX:', panX.toFixed(1), 'panY:', panY.toFixed(1),
       'reserveX:', reserveX.toFixed(0), 'reserveY:', reserveY.toFixed(0)
     );
@@ -480,15 +463,6 @@ export async function poseAlign(
       transform: { zoom: finalZoom, panX, panY, rotation: 0 },
     });
   }
-
-  // ---- Step 6: Also apply zoom & pan to the "reference" slot ----
-  // The reference is informational only; mathematically it's just another slot
-  // and should also receive scaleMatchZoom × globalCropZoom + pan-to-targetY.
-  // But to keep the "reference" UX label meaningful (so the user sees ONE
-  // image with status "reference" and untouched-looking framing), we leave it
-  // at the system-chosen identity transform. This is a UX choice; if you
-  // want the reference also normalized, change this block.
-  // Leaving as-is keeps backward compatibility with the existing UI.
 
   return { mode: 'face', referenceSlotIndex, results };
 }
