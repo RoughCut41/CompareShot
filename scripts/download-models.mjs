@@ -1,67 +1,42 @@
 /**
- * Downloads ONNX models needed by Smart Align.
+ * Sanity-checks that ONNX models exist in public/models/.
  *
- * Runs automatically before `npm run build` and `npm run dev` (via package.json
- * scripts). Skips download if the file already exists locally.
- *
- * Models are pulled from Hugging Face onnx-community, a curated hub of
- * verified ONNX exports of popular models.
+ * Models are committed directly to the repo (in public/models/) rather than
+ * downloaded at build time. This is more robust than relying on external
+ * hosting (Hugging Face requires auth tokens for some files, jsDelivr has
+ * caching delays, etc.). Trade-off: ~20 MB in the repo, which is fine.
  */
-import { existsSync, mkdirSync, statSync, createWriteStream } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pipeline } from 'node:stream/promises';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MODELS_DIR = resolve(__dirname, '..', 'public', 'models');
 
-const MODELS = [
-  {
-    name: 'yolo11n-pose.onnx',
-    url: 'https://huggingface.co/onnx-community/yolo11n-pose/resolve/main/onnx/model.onnx',
-    minSizeBytes: 5 * 1024 * 1024, // sanity check: should be > 5 MB
-  },
+const REQUIRED = [
+  { name: 'yolo11n-pose.onnx', minSizeBytes: 5 * 1024 * 1024 },
 ];
 
-if (!existsSync(MODELS_DIR)) {
-  mkdirSync(MODELS_DIR, { recursive: true });
+let ok = true;
+for (const m of REQUIRED) {
+  const p = resolve(MODELS_DIR, m.name);
+  if (!existsSync(p)) {
+    console.error(`[models] MISSING: ${p}`);
+    ok = false;
+    continue;
+  }
+  const size = statSync(p).size;
+  if (size < m.minSizeBytes) {
+    console.error(`[models] TOO SMALL: ${p} (${size} bytes)`);
+    ok = false;
+    continue;
+  }
+  console.log(`[models] OK: ${m.name} (${(size / 1024 / 1024).toFixed(1)} MB)`);
 }
 
-async function downloadModel(model) {
-  const dest = resolve(MODELS_DIR, model.name);
-  if (existsSync(dest)) {
-    const size = statSync(dest).size;
-    if (size >= model.minSizeBytes) {
-      console.log(`[models] ${model.name} already exists (${(size / 1024 / 1024).toFixed(1)} MB) — skipping`);
-      return;
-    }
-    console.log(`[models] ${model.name} exists but looks incomplete (${size} bytes) — re-downloading`);
-  }
-
-  console.log(`[models] Downloading ${model.name} from ${model.url} …`);
-  const res = await fetch(model.url, { redirect: 'follow' });
-  if (!res.ok) {
-    throw new Error(`Download failed: ${res.status} ${res.statusText}`);
-  }
-  if (!res.body) {
-    throw new Error('Response has no body');
-  }
-  await pipeline(res.body, createWriteStream(dest));
-  const size = statSync(dest).size;
-  console.log(`[models] Saved ${model.name} (${(size / 1024 / 1024).toFixed(1)} MB)`);
-  if (size < model.minSizeBytes) {
-    throw new Error(`Downloaded file too small (${size} bytes) — likely an error page`);
-  }
+if (!ok) {
+  console.error('[models] One or more models are missing or invalid.');
+  console.error('[models] See README for download instructions, or run the curl commands.');
+  process.exit(1);
 }
-
-(async () => {
-  try {
-    for (const m of MODELS) {
-      await downloadModel(m);
-    }
-    console.log('[models] All models ready.');
-  } catch (err) {
-    console.error('[models] Download failed:', err);
-    process.exit(1);
-  }
-})();
+console.log('[models] All models present.');
