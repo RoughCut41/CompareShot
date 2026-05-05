@@ -29,32 +29,27 @@ const CONFIDENCE_THRESHOLD = 0.25;
 const KEYPOINT_VIS_THRESHOLD = 0.5;
 
 interface Keypoint {
-  x: number; // pixel coords in original image
+  x: number;
   y: number;
-  v: number; // visibility / confidence
+  v: number;
 }
 
 interface Person {
   box: { x: number; y: number; w: number; h: number };
   score: number;
-  keypoints: Keypoint[]; // 17 entries
+  keypoints: Keypoint[];
 }
 
 interface PoseData {
   slotIndex: number;
-  /** Translation anchor in original image pixels */
-  anchorX: number;
-  anchorY: number;
-  /**
-   * Scale metric NORMALIZED by the image's longer edge — directly comparable
-   * across images of different sensor resolutions. Values are typically 0.05..0.5.
-   */
+  /** Normalized x: anchorX / naturalWidth (0..1) */
+  anchorXNorm: number;
+  /** Normalized y: anchorY / naturalHeight (0..1) */
+  anchorYNorm: number;
+  /** Normalized scale: anchor distance / longer image edge */
   anchorScale: number;
-  /** Which anchor strategy was used (for diagnostics) */
   anchorMode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
-  /** Detection confidence */
   detectionScore: number;
-  /** Image sharpness (relative comparison only) */
   sharpness: number;
 }
 
@@ -104,7 +99,6 @@ function normalize(values: number[]): number[] {
 
 interface PreprocessedImage {
   data: Float32Array;
-  /** Mapping from model coords (0..640) back to original image pixels */
   scale: number;
   padX: number;
   padY: number;
@@ -113,7 +107,6 @@ interface PreprocessedImage {
 function preprocess(img: HTMLImageElement): PreprocessedImage {
   const W = img.naturalWidth;
   const H = img.naturalHeight;
-
   const scale = INPUT_SIZE / Math.max(W, H);
   const newW = Math.round(W * scale);
   const newH = Math.round(H * scale);
@@ -129,7 +122,6 @@ function preprocess(img: HTMLImageElement): PreprocessedImage {
   ctx.drawImage(img, padX, padY, newW, newH);
 
   const imageData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
-
   const float = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
   const planeSize = INPUT_SIZE * INPUT_SIZE;
   for (let i = 0; i < planeSize; i++) {
@@ -140,11 +132,8 @@ function preprocess(img: HTMLImageElement): PreprocessedImage {
     float[planeSize + i] = g;
     float[2 * planeSize + i] = b;
   }
-
   return { data: float, scale, padX, padY };
 }
-
-// -------- YOLO output postprocessing --------
 
 function postprocess(
   output: Float32Array,
@@ -185,12 +174,7 @@ function postprocess(
     }
 
     people.push({
-      box: {
-        x: cxOrig - wOrig / 2,
-        y: cyOrig - hOrig / 2,
-        w: wOrig,
-        h: hOrig,
-      },
+      box: { x: cxOrig - wOrig / 2, y: cyOrig - hOrig / 2, w: wOrig, h: hOrig },
       score,
       keypoints,
     });
@@ -226,22 +210,20 @@ function nms(people: Person[], iouThreshold: number): Person[] {
 
 // -------- Anchor extraction (multi-anchor median strategy) --------
 
-function extractAnchor(
-  person: Person
-): {
+interface RawAnchor {
   anchorX: number;
   anchorY: number;
-  /** Raw anchor scale in image pixels (will be normalized by caller) */
   anchorScale: number;
   mode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
-} | null {
+}
+
+function extractAnchor(person: Person): RawAnchor | null {
   const kp = person.keypoints;
   const lEye = kp[KP.LEFT_EYE];
   const rEye = kp[KP.RIGHT_EYE];
   const nose = kp[KP.NOSE];
   const lSh = kp[KP.LEFT_SHOULDER];
   const rSh = kp[KP.RIGHT_SHOULDER];
-  // Hips are COCO indices 11, 12
   const lHip = kp[11];
   const rHip = kp[12];
 
@@ -260,13 +242,6 @@ function extractAnchor(
     return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
   }
 
-  // Best case: combine multiple anatomical distance measures for a robust scale.
-  // Each measure is normalized to "eye-to-shoulder units" using approximate ratios:
-  //   shoulder-width       ≈ 1.5 × eye-to-shoulder
-  //   eye-to-eye           ≈ 0.4 × eye-to-shoulder
-  //   nose-to-shoulder-mid ≈ 0.85 × eye-to-shoulder
-  //   eye-to-hip-mid       ≈ 3.5 × eye-to-shoulder
-  // Then take the MEDIAN — outliers (mis-detected keypoints) get absorbed.
   if (eyesGood && shouldersGood) {
     const eyeMidX = (lEye.x + rEye.x) / 2;
     const eyeMidY = (lEye.y + rEye.y) / 2;
@@ -274,7 +249,7 @@ function extractAnchor(
     const shMidY = (lSh.y + rSh.y) / 2;
 
     const measures: number[] = [];
-    measures.push(dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY })); // 1.0×
+    measures.push(dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY }));
     measures.push(dist(lSh, rSh) / 1.5);
     measures.push(dist(lEye, rEye) / 0.4);
     if (noseGood) {
@@ -299,11 +274,10 @@ function extractAnchor(
   if (shouldersGood) {
     const shMidX = (lSh.x + rSh.x) / 2;
     const shMidY = (lSh.y + rSh.y) / 2;
-    const shoulderWidth = dist(lSh, rSh);
     return {
       anchorX: shMidX,
       anchorY: shMidY,
-      anchorScale: Math.max(1, shoulderWidth),
+      anchorScale: Math.max(1, dist(lSh, rSh)),
       mode: 'shoulders-only',
     };
   }
@@ -311,11 +285,10 @@ function extractAnchor(
   if (eyesGood) {
     const eyeMidX = (lEye.x + rEye.x) / 2;
     const eyeMidY = (lEye.y + rEye.y) / 2;
-    const eyeWidth = dist(lEye, rEye);
     return {
       anchorX: eyeMidX,
       anchorY: eyeMidY,
-      anchorScale: Math.max(1, eyeWidth),
+      anchorScale: Math.max(1, dist(lEye, rEye)),
       mode: 'eye-to-eye',
     };
   }
@@ -376,27 +349,30 @@ export async function detectPoseForSlots(
         continue;
       }
 
-      // Normalize the scale by the image's longer edge so it's directly
-      // comparable across cameras with different sensor resolutions.
-      // Without this, a 4284px-wide iPhone photo would yield a 40% larger
-      // anchorScale than a 3000px Android photo of the same scene.
-      const imageDim = Math.max(img.naturalWidth, img.naturalHeight);
-      const normalizedScale = anchor.anchorScale / imageDim;
+      // Normalize ALL anchor properties (position + scale) by image dimensions.
+      // This produces dimensionless values directly comparable across cameras
+      // with different sensor resolutions.
+      const W = img.naturalWidth;
+      const H = img.naturalHeight;
+      const longEdge = Math.max(W, H);
+      const anchorXNorm = anchor.anchorX / W;
+      const anchorYNorm = anchor.anchorY / H;
+      const anchorScaleNorm = anchor.anchorScale / longEdge;
 
       console.log(
         '[CompareShot] Slot', slot.slotIndex,
         '— mode:', anchor.mode,
-        'rawScale:', anchor.anchorScale.toFixed(1),
-        'normScale:', normalizedScale.toFixed(4)
+        'normPos: (' + anchorXNorm.toFixed(3) + ',' + anchorYNorm.toFixed(3) + ')',
+        'normScale:', anchorScaleNorm.toFixed(4)
       );
 
       const sharpness = await imageSharpness(img);
 
       results.push({
         slotIndex: slot.slotIndex,
-        anchorX: anchor.anchorX,
-        anchorY: anchor.anchorY,
-        anchorScale: normalizedScale,
+        anchorXNorm,
+        anchorYNorm,
+        anchorScale: anchorScaleNorm,
         anchorMode: anchor.mode,
         detectionScore: best.score,
         sharpness,
@@ -432,12 +408,22 @@ function poseToTransform(
   currentState: ImageState,
   referenceState: ImageState
 ): AlignTransform {
-  // anchorScale is normalized (anchor-distance / longer-image-edge), so a
-  // direct ratio gives the correct relative-size scaling factor.
-  // Example: if both anchorScales are 0.10, the person occupies the same
-  // fraction of each image, so imageScale = 1 (no zoom needed). If current
-  // is 0.05 and reference is 0.10, current must be 2× zoomed to match.
-  const imageScale = reference.anchorScale / Math.max(1e-6, current.anchorScale);
+  // Both anchorScale values are already normalized (anchor / longer-image-edge).
+  // Both images are independently fitted to the SAME container with `cover`,
+  // which means a person occupying X% of one image will appear larger in the
+  // container if cover-scaling is more aggressive. To compute the correct
+  // container-zoom multiplier so that the person ends up at the same size on
+  // screen, we compare the projected on-screen sizes.
+  //
+  // The on-screen size of the anchor in the reference is:
+  //   refOnScreenSize = reference.anchorScale * refLongEdge * refCover
+  // and the natural on-screen size of the anchor in the current image is:
+  //   curOnScreenSize = current.anchorScale * curLongEdge * curCover
+  // We want these equal after applying our zoom, so:
+  //   zoom = refOnScreenSize / curOnScreenSize
+
+  const refLongEdge = Math.max(referenceState.naturalWidth, referenceState.naturalHeight);
+  const curLongEdge = Math.max(currentState.naturalWidth, currentState.naturalHeight);
 
   const refCover = computeCoverScale(
     referenceState.naturalWidth,
@@ -452,23 +438,33 @@ function poseToTransform(
     currentState._containerH
   );
 
-  const zoom = (refCover * imageScale) / curCover;
+  const refOnScreenSize = reference.anchorScale * refLongEdge * refCover;
+  const curOnScreenSize = current.anchorScale * curLongEdge * curCover;
+  const zoom = refOnScreenSize / Math.max(1e-6, curOnScreenSize);
 
-  const refOffsetX = reference.anchorX - referenceState.naturalWidth / 2;
-  const refOffsetY = reference.anchorY - referenceState.naturalHeight / 2;
-  const refOffsetX_container = refOffsetX * refCover;
-  const refOffsetY_container = refOffsetY * refCover;
+  // Position: where on the container does each anchor land "naturally" (zoom=1, pan=0)?
+  // Anchor position in image-pixels: anchorXNorm * naturalWidth
+  // Offset from image center in image-pixels: anchorXNorm * naturalWidth - naturalWidth/2
+  // Project onto container: × cover scale
+  const refOffsetX_container =
+    (reference.anchorXNorm - 0.5) * referenceState.naturalWidth * refCover;
+  const refOffsetY_container =
+    (reference.anchorYNorm - 0.5) * referenceState.naturalHeight * refCover;
 
-  const curOffsetX = current.anchorX - currentState.naturalWidth / 2;
-  const curOffsetY = current.anchorY - currentState.naturalHeight / 2;
-  const curProjectedX = curOffsetX * refCover * imageScale;
-  const curProjectedY = curOffsetY * refCover * imageScale;
+  // After applying zoom, the current image's anchor will be at:
+  //   (anchorXNorm - 0.5) * curNaturalWidth * curCover * zoom
+  // We need to add panX so this matches refOffsetX_container.
+  const curAnchorOnContainerX =
+    (current.anchorXNorm - 0.5) * currentState.naturalWidth * curCover * zoom;
+  const curAnchorOnContainerY =
+    (current.anchorYNorm - 0.5) * currentState.naturalHeight * curCover * zoom;
 
-  let panX = refOffsetX_container - curProjectedX;
-  let panY = refOffsetY_container - curProjectedY;
+  let panX = refOffsetX_container - curAnchorOnContainerX;
+  let panY = refOffsetY_container - curAnchorOnContainerY;
 
   let finalZoom = Math.max(0.2, Math.min(5, zoom));
 
+  // Auto-fill against black borders
   const cw = currentState._containerW > 0 ? currentState._containerW : 960;
   const ch = currentState._containerH > 0 ? currentState._containerH : 1625;
   const minZoomX = 1 + (2 * Math.abs(panX)) / cw;
