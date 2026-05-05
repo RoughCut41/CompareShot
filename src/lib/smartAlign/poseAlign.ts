@@ -1,13 +1,10 @@
 /**
  * Pose-based Smart Align using YOLO11s-Pose via ONNX Runtime Web.
  *
- * Algorithm:
- *  1. scaleMatchZoom per image so heads end up the same on-screen size.
- *  2. globalCropZoom (binary search ≤ 1.15) so all images can share a Y target.
- *  3. finalZoom = scaleMatchZoom × globalCropZoom for ALL images including ref.
- *  4. Pan limits scale with person-on-screen-size to avoid jarring shifts on
- *     small subjects: max pan = K × personSize. Y is more permissive than X.
- *  5. Hard clamp pans to reserves as final safety against black borders.
+ * DIAGNOSTIC VERSION: extractAnchor logs each candidate measure separately
+ * so we can see how Head-only measures (eye-to-eye, eye-mid-to-nose) compare
+ * to Body measures (eye-to-shoulder, shoulder-width, etc.) before deciding
+ * whether HeadScale-as-primary is the right architectural change.
  */
 import type { Tensor } from 'onnxruntime-web';
 import { decodeImage } from '@/lib/exportRenderer';
@@ -27,10 +24,8 @@ const KEYPOINT_VIS_THRESHOLD = 0.5;
 const MAX_GLOBAL_CROP = 1.15;
 const SAFETY_PX = 1;
 
-// Pan-limit multipliers (in units of person-on-screen-size).
-// Y is allowed more pan than X because eye-line alignment matters more.
-const MAX_PAN_X_FACTOR = 0.4;  // X-pan capped at 0.4 × personSize
-const MAX_PAN_Y_FACTOR = 1.0;  // Y-pan capped at 1.0 × personSize
+const MAX_PAN_X_FACTOR = 0.4;
+const MAX_PAN_Y_FACTOR = 1.0;
 
 interface Keypoint { x: number; y: number; v: number; }
 interface Person { box: { x: number; y: number; w: number; h: number }; score: number; keypoints: Keypoint[]; }
@@ -172,42 +167,190 @@ interface RawAnchor {
   mode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
 }
 
-function extractAnchor(person: Person): RawAnchor | null {
+/**
+ * Extract anchor with separated HEAD vs BODY scale candidates for diagnostics.
+ * Returns the same combined scale as before (no behavioral change), but logs
+ * each candidate so we can analyze which measures are actually stable across
+ * slots and decide if HeadScale-as-primary is the right architectural change.
+ */
+function extractAnchor(person: Person, slotIndex: number): RawAnchor | null {
   const kp = person.keypoints;
   const lEye = kp[KP.LEFT_EYE], rEye = kp[KP.RIGHT_EYE];
   const nose = kp[KP.NOSE];
+  const lEar = kp[KP.LEFT_EAR], rEar = kp[KP.RIGHT_EAR];
   const lSh = kp[KP.LEFT_SHOULDER], rSh = kp[KP.RIGHT_SHOULDER];
   const lHip = kp[11], rHip = kp[12];
 
   const eyesGood = lEye.v > KEYPOINT_VIS_THRESHOLD && rEye.v > KEYPOINT_VIS_THRESHOLD;
   const shouldersGood = lSh.v > KEYPOINT_VIS_THRESHOLD && rSh.v > KEYPOINT_VIS_THRESHOLD;
   const noseGood = nose.v > KEYPOINT_VIS_THRESHOLD;
+  const earsGood = lEar.v > KEYPOINT_VIS_THRESHOLD && rEar.v > KEYPOINT_VIS_THRESHOLD;
   const hipsGood = lHip && rHip && lHip.v > KEYPOINT_VIS_THRESHOLD && rHip.v > KEYPOINT_VIS_THRESHOLD;
 
   const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
     Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 
+  // ===== DIAGNOSTIC LOGGING =====
+  // Log every available raw distance measure with its normalized scale.
+  // The "normalized scale" divides the measure by its expected anatomical
+  // ratio so all candidates can be compared on the same axis.
+
+  const headCandidates: Array<{ name: string; px: number; norm: number; conf: number }> = [];
+  const bodyCandidates: Array<{ name: string; px: number; norm: number; conf: number }> = [];
+
+  let eyeMidX = 0, eyeMidY = 0;
+  if (eyesGood) {
+    eyeMidX = (lEye.x + rEye.x) / 2;
+    eyeMidY = (lEye.y + rEye.y) / 2;
+
+    // HEAD: eye-to-eye (anatomical ratio 1.0 = our reference unit)
+    const eyeEyePx = dist(lEye, rEye);
+    headCandidates.push({
+      name: 'eye-eye',
+      px: eyeEyePx,
+      norm: eyeEyePx / 1.0,
+      conf: lEye.v * rEye.v,
+    });
+
+    if (noseGood) {
+      // HEAD: eye-mid-to-nose (anatomical ratio ~0.65)
+      const eyeMidNosePx = dist({ x: eyeMidX, y: eyeMidY }, nose);
+      headCandidates.push({
+        name: 'eyeMid-nose',
+        px: eyeMidNosePx,
+        norm: eyeMidNosePx / 0.65,
+        conf: Math.min(lEye.v, rEye.v) * nose.v,
+      });
+
+      // HEAD: left-eye-to-nose (anatomical ratio ~0.82)
+      const lEyeNosePx = dist(lEye, nose);
+      headCandidates.push({
+        name: 'lEye-nose',
+        px: lEyeNosePx,
+        norm: lEyeNosePx / 0.82,
+        conf: lEye.v * nose.v,
+      });
+
+      // HEAD: right-eye-to-nose (anatomical ratio ~0.82)
+      const rEyeNosePx = dist(rEye, nose);
+      headCandidates.push({
+        name: 'rEye-nose',
+        px: rEyeNosePx,
+        norm: rEyeNosePx / 0.82,
+        conf: rEye.v * nose.v,
+      });
+    }
+
+    if (earsGood) {
+      // HEAD: ear-to-ear (anatomical ratio ~2.2)
+      const earEarPx = dist(lEar, rEar);
+      // Plausibility: ear-ear should be 1.4×–3.0× eye-eye
+      const plausible = earEarPx > eyeEyePx * 1.4 && earEarPx < eyeEyePx * 3.0;
+      if (plausible) {
+        headCandidates.push({
+          name: 'ear-ear',
+          px: earEarPx,
+          norm: earEarPx / 2.2,
+          conf: lEar.v * rEar.v,
+        });
+      }
+    }
+  }
+
   if (eyesGood && shouldersGood) {
-    const eyeMidX = (lEye.x + rEye.x) / 2, eyeMidY = (lEye.y + rEye.y) / 2;
+    const shMidX = (lSh.x + rSh.x) / 2;
+    const shMidY = (lSh.y + rSh.y) / 2;
+
+    // BODY: eye-to-shoulder-mid (anatomical ratio 1.0 in old "Eye-to-Shoulder Units")
+    bodyCandidates.push({
+      name: 'eyeMid-shMid',
+      px: dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY }),
+      norm: dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY }),
+      conf: Math.min(lEye.v, rEye.v) * Math.min(lSh.v, rSh.v),
+    });
+
+    // BODY: shoulder-width / 1.5
+    bodyCandidates.push({
+      name: 'sh-sh',
+      px: dist(lSh, rSh),
+      norm: dist(lSh, rSh) / 1.5,
+      conf: lSh.v * rSh.v,
+    });
+
+    if (noseGood) {
+      // BODY: nose-to-shoulder-mid / 0.85
+      bodyCandidates.push({
+        name: 'nose-shMid',
+        px: dist(nose, { x: shMidX, y: shMidY }),
+        norm: dist(nose, { x: shMidX, y: shMidY }) / 0.85,
+        conf: nose.v * Math.min(lSh.v, rSh.v),
+      });
+    }
+
+    if (hipsGood) {
+      const hipMidX = (lHip.x + rHip.x) / 2;
+      const hipMidY = (lHip.y + rHip.y) / 2;
+      // BODY: eye-to-hip-mid / 3.5
+      bodyCandidates.push({
+        name: 'eyeMid-hipMid',
+        px: dist({ x: eyeMidX, y: eyeMidY }, { x: hipMidX, y: hipMidY }),
+        norm: dist({ x: eyeMidX, y: eyeMidY }, { x: hipMidX, y: hipMidY }) / 3.5,
+        conf: Math.min(lEye.v, rEye.v) * Math.min(lHip.v, rHip.v),
+      });
+    }
+  }
+
+  // Compute medians for diagnostic comparison
+  const headNorms = headCandidates.map((c) => c.norm);
+  const bodyNorms = bodyCandidates.map((c) => c.norm);
+  const headMedian = headNorms.length > 0 ? median(headNorms) : null;
+  const bodyMedian = bodyNorms.length > 0 ? median(bodyNorms) : null;
+
+  console.log(
+    '[CompareShot DIAG] Slot', slotIndex,
+    '— HEAD candidates:',
+    headCandidates.map((c) =>
+      `${c.name}(px=${c.px.toFixed(1)}, norm=${c.norm.toFixed(1)}, conf=${c.conf.toFixed(2)})`
+    ).join(', ')
+  );
+  console.log(
+    '[CompareShot DIAG] Slot', slotIndex,
+    '— BODY candidates:',
+    bodyCandidates.map((c) =>
+      `${c.name}(px=${c.px.toFixed(1)}, norm=${c.norm.toFixed(1)}, conf=${c.conf.toFixed(2)})`
+    ).join(', ')
+  );
+  console.log(
+    '[CompareShot DIAG] Slot', slotIndex,
+    '— headMedian:', headMedian !== null ? headMedian.toFixed(1) : 'n/a',
+    'bodyMedian:', bodyMedian !== null ? bodyMedian.toFixed(1) : 'n/a',
+    'head/body ratio:', (headMedian !== null && bodyMedian !== null) ? (headMedian / bodyMedian).toFixed(3) : 'n/a'
+  );
+
+  // ===== END DIAGNOSTIC LOGGING =====
+
+  // Behavior unchanged: same combined median as before.
+  if (eyesGood && shouldersGood) {
+    const eyeMidX_a = (lEye.x + rEye.x) / 2, eyeMidY_a = (lEye.y + rEye.y) / 2;
     const shMidX = (lSh.x + rSh.x) / 2, shMidY = (lSh.y + rSh.y) / 2;
     const measures: number[] = [];
-    measures.push(dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY }));
+    measures.push(dist({ x: eyeMidX_a, y: eyeMidY_a }, { x: shMidX, y: shMidY }));
     measures.push(dist(lSh, rSh) / 1.5);
     measures.push(dist(lEye, rEye) / 0.4);
     if (noseGood) measures.push(dist(nose, { x: shMidX, y: shMidY }) / 0.85);
     if (hipsGood) {
       const hipMidX = (lHip.x + rHip.x) / 2, hipMidY = (lHip.y + rHip.y) / 2;
-      measures.push(dist({ x: eyeMidX, y: eyeMidY }, { x: hipMidX, y: hipMidY }) / 3.5);
+      measures.push(dist({ x: eyeMidX_a, y: eyeMidY_a }, { x: hipMidX, y: hipMidY }) / 3.5);
     }
-    return { anchorX: eyeMidX, anchorY: eyeMidY, anchorScale: Math.max(1, median(measures)), mode: 'multi-anchor' };
+    return { anchorX: eyeMidX_a, anchorY: eyeMidY_a, anchorScale: Math.max(1, median(measures)), mode: 'multi-anchor' };
   }
   if (shouldersGood) {
     const shMidX = (lSh.x + rSh.x) / 2, shMidY = (lSh.y + rSh.y) / 2;
     return { anchorX: shMidX, anchorY: shMidY, anchorScale: Math.max(1, dist(lSh, rSh)), mode: 'shoulders-only' };
   }
   if (eyesGood) {
-    const eyeMidX = (lEye.x + rEye.x) / 2, eyeMidY = (lEye.y + rEye.y) / 2;
-    return { anchorX: eyeMidX, anchorY: eyeMidY, anchorScale: Math.max(1, dist(lEye, rEye)), mode: 'eye-to-eye' };
+    const eyeMidX_a = (lEye.x + rEye.x) / 2, eyeMidY_a = (lEye.y + rEye.y) / 2;
+    return { anchorX: eyeMidX_a, anchorY: eyeMidY_a, anchorScale: Math.max(1, dist(lEye, rEye)), mode: 'eye-to-eye' };
   }
   return null;
 }
@@ -242,7 +385,7 @@ export async function detectPoseForSlots(
         const a = people[k].box.w * people[k].box.h;
         if (a > bestArea) { best = people[k]; bestArea = a; }
       }
-      const anchor = extractAnchor(best);
+      const anchor = extractAnchor(best, slot.slotIndex);
       if (!anchor) { console.warn('[CompareShot] Slot', slot.slotIndex, '— no usable keypoints'); results.push(null); continue; }
       const W = img.naturalWidth, H = img.naturalHeight;
       const longEdge = Math.max(W, H);
@@ -353,7 +496,6 @@ export async function poseAlign(
   const reference = withPose[refLocal];
   const referenceSlotIndex = reference.slotIndex;
 
-  // ---- Step 1: scaleMatchZoom per slot (target = median on-screen size) ----
   const calcs: SlotCalc[] = withPose.map((p, i) => {
     const slot = slots.find((s) => s.slotIndex === p.slotIndex)!;
     const cover = computeCoverScale(
@@ -391,11 +533,9 @@ export async function poseAlign(
     );
   }
 
-  // ---- Step 2: globalCropZoom ----
   const globalCropZoom = solveGlobalCropZoom(calcs);
   console.log('[CompareShot] globalCropZoom:', globalCropZoom.toFixed(4));
 
-  // ---- Step 3: Y-target ----
   const { lo: globalLoY, hi: globalHiY, perSlot } = computeFeasibleYInterval(calcs, globalCropZoom);
   const naturalEyeYs = perSlot.map((s) => s.baseY);
   const preferredY = median(naturalEyeYs);
@@ -407,14 +547,12 @@ export async function poseAlign(
     'targetY:', targetY.toFixed(1)
   );
 
-  // ---- Step 4: X-target ----
   const naturalEyeXs = calcs.map((c) => {
     const z = c.scaleMatchZoom * globalCropZoom;
     return (c.pose.anchorXNorm - 0.5) * c.pose.naturalWidth * c.cover * z;
   });
   const targetX = median(naturalEyeXs);
 
-  // ---- Step 5: Per-image transforms with size-proportional pan limits ----
   const results: AlignResult[] = [];
   for (let i = 0; i < slots.length; i++) {
     const slot = slots[i];
@@ -439,15 +577,10 @@ export async function poseAlign(
     let panX = targetX - baseX;
     let panY = targetY - baseY;
 
-    // Person's on-screen size at finalZoom — used as the unit for pan limits.
     const personSize = calc.pose.anchorScale * Math.max(calc.pose.naturalWidth, calc.pose.naturalHeight) * calc.cover * finalZoom;
     const maxPanX = personSize * MAX_PAN_X_FACTOR;
     const maxPanY = personSize * MAX_PAN_Y_FACTOR;
 
-    const panXBeforeSizeClamp = panX;
-    const panYBeforeSizeClamp = panY;
-
-    // Two-stage clamp: first to size-proportional limit, then to physical reserve.
     panX = clamp(panX, -maxPanX, maxPanX);
     panY = clamp(panY, -maxPanY, maxPanY);
     panX = clamp(panX, -reserveX, reserveX);
@@ -458,8 +591,7 @@ export async function poseAlign(
       '[CompareShot] Transform slot', slot.slotIndex,
       isReference ? '(REFERENCE)' : '',
       'finalZoom:', finalZoom.toFixed(3),
-      'panX:', panX.toFixed(1), '(was', panXBeforeSizeClamp.toFixed(1) + ', maxByPerson:', maxPanX.toFixed(0) + ')',
-      'panY:', panY.toFixed(1), '(was', panYBeforeSizeClamp.toFixed(1) + ', maxByPerson:', maxPanY.toFixed(0) + ')'
+      'panX:', panX.toFixed(1), 'panY:', panY.toFixed(1)
     );
 
     results.push({
