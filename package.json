@@ -5,6 +5,8 @@
   "type": "module",
   "description": "Browser-based tool for comparing camera photos side by side",
   "scripts": {
+    "predev": "node scripts/download-models.mjs",
+    "prebuild": "node scripts/download-models.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
