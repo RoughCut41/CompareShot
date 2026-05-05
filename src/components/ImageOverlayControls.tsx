@@ -19,7 +19,7 @@ interface Props {
   onDelete: () => void;
 }
 
-const ZOOM_STEP = 0.1;
+const ZOOM_STEP = 0.02;
 const ZOOM_MIN = 0.1;
 const ZOOM_MAX = 10;
 
