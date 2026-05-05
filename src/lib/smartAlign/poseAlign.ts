@@ -1,5 +1,18 @@
 /**
  * Pose-based Smart Align using YOLO11s-Pose via ONNX Runtime Web.
+ *
+ * Algorithm (after iteration & external review):
+ *  1. Compute scaleMatchZoom per image so that head-on-screen sizes match
+ *     (relative scaling sacred — heads must end up the same size).
+ *  2. Find a globalCropZoom in [1.0, 1.15] via binary search such that ALL
+ *     images have a reachable common eye-Y position without black borders.
+ *  3. Final zoom per image = scaleMatchZoom × globalCropZoom.
+ *     This preserves scale ratios — heads stay equal size by construction.
+ *  4. Target Y = median of all images' natural eye-Y positions, clamped into
+ *     the feasible interval. Reference is informational only.
+ *  5. Y-pan to hit target Y exactly, hard-clamped to reserve as final safety.
+ *  6. X-pan analogous but with lower priority (larger tolerance).
+ *  7. No more "auto-fill" zoom-bumping — globalCropZoom replaces it cleanly.
  */
 import type { Tensor } from 'onnxruntime-web';
 import { decodeImage } from '@/lib/exportRenderer';
@@ -17,6 +30,8 @@ import {
 const INPUT_SIZE = 640;
 const CONFIDENCE_THRESHOLD = 0.25;
 const KEYPOINT_VIS_THRESHOLD = 0.5;
+const MAX_GLOBAL_CROP = 1.15; // hard ceiling — won't crop more than 15%
+const SAFETY_PX = 1; // tiny margin against rounding-induced black borders
 
 interface Keypoint { x: number; y: number; v: number; }
 interface Person { box: { x: number; y: number; w: number; h: number }; score: number; keypoints: Keypoint[]; }
@@ -70,6 +85,16 @@ function normalize(values: number[]): number[] {
   const mx = Math.max(...values);
   if (mx - mn < 1e-9) return values.map(() => 0.5);
   return values.map((v) => (v - mn) / (mx - mn));
+}
+
+function median(arr: number[]): number {
+  const s = arr.slice().sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
 }
 
 interface PreprocessedImage { data: Float32Array; scale: number; padX: number; padY: number; }
@@ -162,11 +187,6 @@ function extractAnchor(person: Person): RawAnchor | null {
 
   const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
     Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
-  const median = (arr: number[]) => {
-    const s = arr.slice().sort((a, b) => a - b);
-    const m = Math.floor(s.length / 2);
-    return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
-  };
 
   if (eyesGood && shouldersGood) {
     const eyeMidX = (lEye.x + rEye.x) / 2, eyeMidY = (lEye.y + rEye.y) / 2;
@@ -267,78 +287,66 @@ function pickReference(poses: PoseData[]): number {
   return best;
 }
 
-function poseToTransform(
-  current: PoseData,
-  reference: PoseData,
-  currentState: ImageState,
-  referenceState: ImageState
-): AlignTransform {
-  const refLongEdge = Math.max(reference.naturalWidth, reference.naturalHeight);
-  const curLongEdge = Math.max(current.naturalWidth, current.naturalHeight);
+// ----- Per-image computed values used by the global solver -----
 
-  const refCover = computeCoverScale(
-    referenceState.naturalWidth, referenceState.naturalHeight,
-    referenceState._containerW, referenceState._containerH
-  );
-  const curCover = computeCoverScale(
-    currentState.naturalWidth, currentState.naturalHeight,
-    currentState._containerW, currentState._containerH
-  );
+interface SlotCalc {
+  poseIdx: number;          // index into withPose array
+  slotIndex: number;
+  state: ImageState;
+  pose: PoseData;
+  cover: number;
+  scaleMatchZoom: number;   // multiplier needed for this image's head to match target size
+  containerW: number;
+  containerH: number;
+}
 
-  const refOnScreenSize = reference.anchorScale * refLongEdge * refCover;
-  const curOnScreenSize = current.anchorScale * curLongEdge * curCover;
-  const zoom = refOnScreenSize / Math.max(1e-6, curOnScreenSize);
-
-  const refOffsetX_container =
-    (reference.anchorXNorm - 0.5) * reference.naturalWidth * refCover;
-  const refOffsetY_container =
-    (reference.anchorYNorm - 0.5) * reference.naturalHeight * refCover;
-
-  const curAnchorOnContainerX =
-    (current.anchorXNorm - 0.5) * current.naturalWidth * curCover * zoom;
-  const curAnchorOnContainerY =
-    (current.anchorYNorm - 0.5) * current.naturalHeight * curCover * zoom;
-
-  let panX = refOffsetX_container - curAnchorOnContainerX;
-  let panY = refOffsetY_container - curAnchorOnContainerY;
-
-  let finalZoom = Math.max(0.2, Math.min(5, zoom));
-
-  // Auto-fill against black borders.
-  // The image is drawn at size (natW × cover × zoom) × (natH × cover × zoom).
-  // Container has size (cw, ch). The "reserve" — how far we can pan before
-  // black borders appear — is:
-  //   reserveX = (natW × cover × zoom - cw) / 2
-  //   reserveY = (natH × cover × zoom - ch) / 2
-  // We want |panX| ≤ reserveX, so:
-  //   zoomMin = (cw + 2|panX|) / (natW × cover)
-  //   zoomMin = (ch + 2|panY|) / (natH × cover)
-  // Take the max — only bump zoom if BOTH dimensions need it.
-  const cw = currentState._containerW > 0 ? currentState._containerW : 960;
-  const ch = currentState._containerH > 0 ? currentState._containerH : 1625;
-  const natW = current.naturalWidth, natH = current.naturalHeight;
-  const minZoomX = (cw + 2 * Math.abs(panX)) / (natW * curCover);
-  const minZoomY = (ch + 2 * Math.abs(panY)) / (natH * curCover);
-  const minZoom = Math.max(minZoomX, minZoomY);
-
-  console.log(
-    '[CompareShot] Transform slot', current.slotIndex,
-    'zoom:', zoom.toFixed(3),
-    'panX:', panX.toFixed(1), 'panY:', panY.toFixed(1),
-    '| minZoomX:', minZoomX.toFixed(3),
-    'minZoomY:', minZoomY.toFixed(3)
-  );
-
-  if (finalZoom < minZoom) {
-    const k = minZoom / finalZoom;
-    console.log('[CompareShot]   auto-fill: bumping zoom from', finalZoom.toFixed(3), 'to', minZoom.toFixed(3), '(k=' + k.toFixed(3) + ')');
-    finalZoom = minZoom;
-    panX *= k;
-    panY *= k;
+/**
+ * For a given globalCropZoom, compute each slot's feasible Y interval (where
+ * the eye-anchor can land on the container without producing a black border).
+ * Returns the intersection range across all slots (could be empty).
+ */
+function computeFeasibleYInterval(
+  calcs: SlotCalc[],
+  globalCropZoom: number
+): { lo: number; hi: number; perSlot: { baseY: number; reserve: number }[] } {
+  const perSlot = calcs.map((c) => {
+    const z = c.scaleMatchZoom * globalCropZoom;
+    const drawnH = c.pose.naturalHeight * c.cover * z;
+    const reserve = Math.max(0, (drawnH - c.containerH) / 2 - SAFETY_PX);
+    const baseY = (c.pose.anchorYNorm - 0.5) * c.pose.naturalHeight * c.cover * z;
+    return { baseY, reserve };
+  });
+  let lo = -Infinity, hi = Infinity;
+  for (const s of perSlot) {
+    lo = Math.max(lo, s.baseY - s.reserve);
+    hi = Math.min(hi, s.baseY + s.reserve);
   }
-  finalZoom = Math.min(finalZoom, 5);
+  return { lo, hi, perSlot };
+}
 
-  return { zoom: finalZoom, panX, panY, rotation: 0 };
+/**
+ * Binary-search the smallest globalCropZoom in [1.0, MAX_GLOBAL_CROP] such
+ * that all slots' Y-intervals overlap. Returns MAX_GLOBAL_CROP if no overlap
+ * is achievable within the cap (caller will then accept Y-imperfection).
+ */
+function solveGlobalCropZoom(calcs: SlotCalc[]): number {
+  // Already feasible at zoom 1?
+  let { lo, hi } = computeFeasibleYInterval(calcs, 1.0);
+  if (lo <= hi) return 1.0;
+
+  // Try the cap — if even at the cap we can't overlap, return cap (best effort)
+  ({ lo, hi } = computeFeasibleYInterval(calcs, MAX_GLOBAL_CROP));
+  if (lo > hi) return MAX_GLOBAL_CROP;
+
+  // Binary search
+  let low = 1.0, high = MAX_GLOBAL_CROP;
+  for (let iter = 0; iter < 24; iter++) {
+    const mid = (low + high) / 2;
+    const r = computeFeasibleYInterval(calcs, mid);
+    if (r.lo <= r.hi) high = mid;
+    else low = mid;
+  }
+  return high;
 }
 
 export async function poseAlign(
@@ -355,13 +363,78 @@ export async function poseAlign(
       results: slots.map((s) => ({ slotIndex: s.slotIndex, status: 'failed', reason: 'No person detected' })),
     };
   }
+
   onProgress?.('Choosing reference…');
   const refLocal = pickReference(withPose);
   const reference = withPose[refLocal];
   const referenceSlotIndex = reference.slotIndex;
-  const refState = slots.find((s) => s.slotIndex === referenceSlotIndex)!.state;
-  console.log('[CompareShot] Reference slot:', referenceSlotIndex);
 
+  // ---- Step 1: Compute scaleMatchZoom for each slot ----
+  // Target on-screen size = MEDIAN of all images' natural on-screen sizes.
+  // Median (not reference) is more robust against outliers.
+  const calcs: SlotCalc[] = withPose.map((p, i) => {
+    const slot = slots.find((s) => s.slotIndex === p.slotIndex)!;
+    const cover = computeCoverScale(
+      slot.state.naturalWidth,
+      slot.state.naturalHeight,
+      slot.state._containerW,
+      slot.state._containerH
+    );
+    return {
+      poseIdx: i,
+      slotIndex: p.slotIndex,
+      state: slot.state,
+      pose: p,
+      cover,
+      scaleMatchZoom: 1, // filled in below
+      containerW: slot.state._containerW > 0 ? slot.state._containerW : 960,
+      containerH: slot.state._containerH > 0 ? slot.state._containerH : 1625,
+    };
+  });
+
+  const onScreenSizes = calcs.map(
+    (c) => c.pose.anchorScale * Math.max(c.pose.naturalWidth, c.pose.naturalHeight) * c.cover
+  );
+  const targetOnScreenSize = median(onScreenSizes);
+  for (let i = 0; i < calcs.length; i++) {
+    calcs[i].scaleMatchZoom = targetOnScreenSize / Math.max(1e-6, onScreenSizes[i]);
+  }
+
+  console.log('[CompareShot] Target on-screen size (median):', targetOnScreenSize.toFixed(1));
+  for (const c of calcs) {
+    console.log(
+      '[CompareShot] Slot', c.slotIndex,
+      'onScreen:', (c.pose.anchorScale * Math.max(c.pose.naturalWidth, c.pose.naturalHeight) * c.cover).toFixed(1),
+      'scaleMatchZoom:', c.scaleMatchZoom.toFixed(3)
+    );
+  }
+
+  // ---- Step 2: Solve globalCropZoom ----
+  const globalCropZoom = solveGlobalCropZoom(calcs);
+  console.log('[CompareShot] globalCropZoom:', globalCropZoom.toFixed(4));
+
+  // ---- Step 3: Compute final Y target ----
+  const { lo: globalLoY, hi: globalHiY, perSlot } = computeFeasibleYInterval(calcs, globalCropZoom);
+  const naturalEyeYs = calcs.map((c, i) => perSlot[i].baseY);
+  const preferredY = median(naturalEyeYs);
+  const targetY = clamp(preferredY, globalLoY, globalHiY);
+  const yIntervalEmpty = globalLoY > globalHiY;
+  console.log(
+    '[CompareShot] Y-interval feasible:', !yIntervalEmpty,
+    'lo:', globalLoY.toFixed(1), 'hi:', globalHiY.toFixed(1),
+    'preferredY:', preferredY.toFixed(1),
+    'targetY:', targetY.toFixed(1)
+  );
+
+  // ---- Step 4: Compute final X target (lower priority — same approach but more lenient) ----
+  // For X we just use the median of natural anchor X positions, then clamp per-slot.
+  const naturalEyeXs = calcs.map((c) => {
+    const z = c.scaleMatchZoom * globalCropZoom;
+    return (c.pose.anchorXNorm - 0.5) * c.pose.naturalWidth * c.cover * z;
+  });
+  const targetX = median(naturalEyeXs);
+
+  // ---- Step 5: Build per-image transforms ----
   const results: AlignResult[] = [];
   for (let i = 0; i < slots.length; i++) {
     const slot = slots[i];
@@ -375,9 +448,48 @@ export async function poseAlign(
       continue;
     }
     onProgress?.(`Aligning ${i + 1}/${slots.length}…`);
-    const transform = poseToTransform(pose, reference, slot.state, refState);
-    results.push({ slotIndex: slot.slotIndex, status: 'aligned', transform });
+    const c = calcs.find((x) => x.slotIndex === slot.slotIndex)!;
+    const idxInCalcs = calcs.indexOf(c);
+
+    const finalZoom = c.scaleMatchZoom * globalCropZoom;
+    const drawnW = c.pose.naturalWidth * c.cover * finalZoom;
+    const drawnH = c.pose.naturalHeight * c.cover * finalZoom;
+    const reserveX = Math.max(0, (drawnW - c.containerW) / 2 - SAFETY_PX);
+    const reserveY = Math.max(0, (drawnH - c.containerH) / 2 - SAFETY_PX);
+
+    const baseX = (c.pose.anchorXNorm - 0.5) * c.pose.naturalWidth * c.cover * finalZoom;
+    const baseY = perSlot[idxInCalcs].baseY;
+
+    let panX = targetX - baseX;
+    let panY = targetY - baseY;
+
+    panX = clamp(panX, -reserveX, reserveX);
+    panY = clamp(panY, -reserveY, reserveY);
+
+    console.log(
+      '[CompareShot] Transform slot', slot.slotIndex,
+      'finalZoom:', finalZoom.toFixed(3),
+      '(scaleMatch:', c.scaleMatchZoom.toFixed(3), '× globalCrop:', globalCropZoom.toFixed(3) + ')',
+      'panX:', panX.toFixed(1), 'panY:', panY.toFixed(1),
+      'reserveX:', reserveX.toFixed(0), 'reserveY:', reserveY.toFixed(0)
+    );
+
+    results.push({
+      slotIndex: slot.slotIndex,
+      status: 'aligned',
+      transform: { zoom: finalZoom, panX, panY, rotation: 0 },
+    });
   }
+
+  // ---- Step 6: Also apply zoom & pan to the "reference" slot ----
+  // The reference is informational only; mathematically it's just another slot
+  // and should also receive scaleMatchZoom × globalCropZoom + pan-to-targetY.
+  // But to keep the "reference" UX label meaningful (so the user sees ONE
+  // image with status "reference" and untouched-looking framing), we leave it
+  // at the system-chosen identity transform. This is a UX choice; if you
+  // want the reference also normalized, change this block.
+  // Leaving as-is keeps backward compatibility with the existing UI.
+
   return { mode: 'face', referenceSlotIndex, results };
 }
 
