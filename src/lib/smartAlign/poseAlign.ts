@@ -14,7 +14,7 @@
  *    high-confidence, use shoulder midpoint as anchor instead.
  *  - Auto-fill: bump zoom so no black borders appear.
  */
-import type { InferenceSession, Tensor } from 'onnxruntime-web';
+import type { Tensor } from 'onnxruntime-web';
 import { decodeImage } from '@/lib/exportRenderer';
 import { ImageState } from '@/lib/types';
 import { loadOrt } from './loadOrt';
