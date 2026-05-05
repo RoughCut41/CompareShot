@@ -1,15 +1,5 @@
 /**
  * Pose-based Smart Align using YOLO11s-Pose via ONNX Runtime Web.
- *
- * Strategy:
- *  - Run YOLO11-Pose on every input image at 640×640 input resolution.
- *  - Pick the LARGEST detected person per image (closest to camera).
- *  - Use multiple anatomical distances combined via median for a robust
- *    scale metric. This avoids over-correcting when a single distance
- *    happens to be off due to pose variation.
- *  - Normalize the scale by the image's longer edge so cameras with
- *    different sensor resolutions can be compared directly.
- *  - Auto-fill: bump zoom so no black borders appear.
  */
 import type { Tensor } from 'onnxruntime-web';
 import { decodeImage } from '@/lib/exportRenderer';
@@ -28,29 +18,20 @@ const INPUT_SIZE = 640;
 const CONFIDENCE_THRESHOLD = 0.25;
 const KEYPOINT_VIS_THRESHOLD = 0.5;
 
-interface Keypoint {
-  x: number;
-  y: number;
-  v: number;
-}
-
-interface Person {
-  box: { x: number; y: number; w: number; h: number };
-  score: number;
-  keypoints: Keypoint[];
-}
+interface Keypoint { x: number; y: number; v: number; }
+interface Person { box: { x: number; y: number; w: number; h: number }; score: number; keypoints: Keypoint[]; }
 
 interface PoseData {
   slotIndex: number;
-  /** Normalized x: anchorX / naturalWidth (0..1) */
   anchorXNorm: number;
-  /** Normalized y: anchorY / naturalHeight (0..1) */
   anchorYNorm: number;
-  /** Normalized scale: anchor distance / longer image edge */
   anchorScale: number;
   anchorMode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
   detectionScore: number;
   sharpness: number;
+  // Capture image dimensions at detection time so we can debug later
+  naturalWidth: number;
+  naturalHeight: number;
 }
 
 function computeCoverScale(naturalW: number, naturalH: number, containerW: number, containerH: number) {
@@ -64,8 +45,7 @@ async function imageSharpness(img: HTMLImageElement, maxDim = 400): Promise<numb
   const w = Math.max(8, Math.round(img.naturalWidth * ratio));
   const h = Math.max(8, Math.round(img.naturalHeight * ratio));
   const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
+  canvas.width = w; canvas.height = h;
   const ctx = canvas.getContext('2d')!;
   ctx.drawImage(img, 0, 0, w, h);
   const data = ctx.getImageData(0, 0, w, h).data;
@@ -78,9 +58,7 @@ async function imageSharpness(img: HTMLImageElement, maxDim = 400): Promise<numb
     for (let x = 1; x < w - 1; x++) {
       const c = y * w + x;
       const lap = 4 * gray[c] - gray[c - 1] - gray[c + 1] - gray[c - w] - gray[c + w];
-      sum += lap;
-      sumSq += lap * lap;
-      n++;
+      sum += lap; sumSq += lap * lap; n++;
     }
   }
   if (n === 0) return 0;
@@ -95,71 +73,44 @@ function normalize(values: number[]): number[] {
   return values.map((v) => (v - mn) / (mx - mn));
 }
 
-// -------- Image preprocessing for YOLO --------
-
-interface PreprocessedImage {
-  data: Float32Array;
-  scale: number;
-  padX: number;
-  padY: number;
-}
+interface PreprocessedImage { data: Float32Array; scale: number; padX: number; padY: number; }
 
 function preprocess(img: HTMLImageElement): PreprocessedImage {
-  const W = img.naturalWidth;
-  const H = img.naturalHeight;
+  const W = img.naturalWidth, H = img.naturalHeight;
   const scale = INPUT_SIZE / Math.max(W, H);
-  const newW = Math.round(W * scale);
-  const newH = Math.round(H * scale);
+  const newW = Math.round(W * scale), newH = Math.round(H * scale);
   const padX = Math.floor((INPUT_SIZE - newW) / 2);
   const padY = Math.floor((INPUT_SIZE - newH) / 2);
-
   const canvas = document.createElement('canvas');
-  canvas.width = INPUT_SIZE;
-  canvas.height = INPUT_SIZE;
+  canvas.width = INPUT_SIZE; canvas.height = INPUT_SIZE;
   const ctx = canvas.getContext('2d')!;
   ctx.fillStyle = 'rgb(114, 114, 114)';
   ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
   ctx.drawImage(img, padX, padY, newW, newH);
-
   const imageData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
   const float = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
   const planeSize = INPUT_SIZE * INPUT_SIZE;
   for (let i = 0; i < planeSize; i++) {
-    const r = imageData[i * 4] / 255;
-    const g = imageData[i * 4 + 1] / 255;
-    const b = imageData[i * 4 + 2] / 255;
-    float[i] = r;
-    float[planeSize + i] = g;
-    float[2 * planeSize + i] = b;
+    float[i] = imageData[i * 4] / 255;
+    float[planeSize + i] = imageData[i * 4 + 1] / 255;
+    float[2 * planeSize + i] = imageData[i * 4 + 2] / 255;
   }
   return { data: float, scale, padX, padY };
 }
 
-function postprocess(
-  output: Float32Array,
-  numDetections: number,
-  pre: PreprocessedImage,
-  origW: number,
-  origH: number
-): Person[] {
+function postprocess(output: Float32Array, numDetections: number, pre: PreprocessedImage, origW: number, origH: number): Person[] {
   const people: Person[] = [];
-  const kpStartChannel = 5;
-  const numKeypoints = 17;
-
+  const kpStartChannel = 5, numKeypoints = 17;
   for (let i = 0; i < numDetections; i++) {
     const score = output[4 * numDetections + i];
     if (score < CONFIDENCE_THRESHOLD) continue;
-
     const cxModel = output[0 * numDetections + i];
     const cyModel = output[1 * numDetections + i];
     const wModel = output[2 * numDetections + i];
     const hModel = output[3 * numDetections + i];
-
     const cxOrig = (cxModel - pre.padX) / pre.scale;
     const cyOrig = (cyModel - pre.padY) / pre.scale;
-    const wOrig = wModel / pre.scale;
-    const hOrig = hModel / pre.scale;
-
+    const wOrig = wModel / pre.scale, hOrig = hModel / pre.scale;
     const keypoints: Keypoint[] = [];
     for (let k = 0; k < numKeypoints; k++) {
       const xCh = kpStartChannel + k * 3;
@@ -168,22 +119,11 @@ function postprocess(
       const xModel = output[xCh * numDetections + i];
       const yModel = output[yCh * numDetections + i];
       const v = output[vCh * numDetections + i];
-      const x = (xModel - pre.padX) / pre.scale;
-      const y = (yModel - pre.padY) / pre.scale;
-      keypoints.push({ x, y, v });
+      keypoints.push({ x: (xModel - pre.padX) / pre.scale, y: (yModel - pre.padY) / pre.scale, v });
     }
-
-    people.push({
-      box: { x: cxOrig - wOrig / 2, y: cyOrig - hOrig / 2, w: wOrig, h: hOrig },
-      score,
-      keypoints,
-    });
+    people.push({ box: { x: cxOrig - wOrig / 2, y: cyOrig - hOrig / 2, w: wOrig, h: hOrig }, score, keypoints });
   }
-
-  return nms(people, 0.5).filter(
-    (p) => p.box.x + p.box.w > 0 && p.box.y + p.box.h > 0 &&
-           p.box.x < origW && p.box.y < origH
-  );
+  return nms(people, 0.5).filter((p) => p.box.x + p.box.w > 0 && p.box.y + p.box.h > 0 && p.box.x < origW && p.box.y < origH);
 }
 
 function nms(people: Person[], iouThreshold: number): Person[] {
@@ -192,111 +132,67 @@ function nms(people: Person[], iouThreshold: number): Person[] {
   for (const p of sorted) {
     let suppressed = false;
     for (const k of kept) {
-      const x1 = Math.max(p.box.x, k.box.x);
-      const y1 = Math.max(p.box.y, k.box.y);
+      const x1 = Math.max(p.box.x, k.box.x), y1 = Math.max(p.box.y, k.box.y);
       const x2 = Math.min(p.box.x + p.box.w, k.box.x + k.box.w);
       const y2 = Math.min(p.box.y + p.box.h, k.box.y + k.box.h);
       const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
       const union = p.box.w * p.box.h + k.box.w * k.box.h - inter;
-      if (union > 0 && inter / union > iouThreshold) {
-        suppressed = true;
-        break;
-      }
+      if (union > 0 && inter / union > iouThreshold) { suppressed = true; break; }
     }
     if (!suppressed) kept.push(p);
   }
   return kept;
 }
 
-// -------- Anchor extraction (multi-anchor median strategy) --------
-
 interface RawAnchor {
-  anchorX: number;
-  anchorY: number;
-  anchorScale: number;
+  anchorX: number; anchorY: number; anchorScale: number;
   mode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
 }
 
 function extractAnchor(person: Person): RawAnchor | null {
   const kp = person.keypoints;
-  const lEye = kp[KP.LEFT_EYE];
-  const rEye = kp[KP.RIGHT_EYE];
+  const lEye = kp[KP.LEFT_EYE], rEye = kp[KP.RIGHT_EYE];
   const nose = kp[KP.NOSE];
-  const lSh = kp[KP.LEFT_SHOULDER];
-  const rSh = kp[KP.RIGHT_SHOULDER];
-  const lHip = kp[11];
-  const rHip = kp[12];
+  const lSh = kp[KP.LEFT_SHOULDER], rSh = kp[KP.RIGHT_SHOULDER];
+  const lHip = kp[11], rHip = kp[12];
 
   const eyesGood = lEye.v > KEYPOINT_VIS_THRESHOLD && rEye.v > KEYPOINT_VIS_THRESHOLD;
   const shouldersGood = lSh.v > KEYPOINT_VIS_THRESHOLD && rSh.v > KEYPOINT_VIS_THRESHOLD;
   const noseGood = nose.v > KEYPOINT_VIS_THRESHOLD;
-  const hipsGood =
-    lHip && rHip && lHip.v > KEYPOINT_VIS_THRESHOLD && rHip.v > KEYPOINT_VIS_THRESHOLD;
+  const hipsGood = lHip && rHip && lHip.v > KEYPOINT_VIS_THRESHOLD && rHip.v > KEYPOINT_VIS_THRESHOLD;
 
-  function dist(a: { x: number; y: number }, b: { x: number; y: number }): number {
-    return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
-  }
-  function median(arr: number[]): number {
+  const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+    Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+  const median = (arr: number[]) => {
     const s = arr.slice().sort((a, b) => a - b);
     const m = Math.floor(s.length / 2);
     return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
-  }
+  };
 
   if (eyesGood && shouldersGood) {
-    const eyeMidX = (lEye.x + rEye.x) / 2;
-    const eyeMidY = (lEye.y + rEye.y) / 2;
-    const shMidX = (lSh.x + rSh.x) / 2;
-    const shMidY = (lSh.y + rSh.y) / 2;
-
+    const eyeMidX = (lEye.x + rEye.x) / 2, eyeMidY = (lEye.y + rEye.y) / 2;
+    const shMidX = (lSh.x + rSh.x) / 2, shMidY = (lSh.y + rSh.y) / 2;
     const measures: number[] = [];
     measures.push(dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY }));
     measures.push(dist(lSh, rSh) / 1.5);
     measures.push(dist(lEye, rEye) / 0.4);
-    if (noseGood) {
-      measures.push(dist(nose, { x: shMidX, y: shMidY }) / 0.85);
-    }
+    if (noseGood) measures.push(dist(nose, { x: shMidX, y: shMidY }) / 0.85);
     if (hipsGood) {
-      const hipMidX = (lHip.x + rHip.x) / 2;
-      const hipMidY = (lHip.y + rHip.y) / 2;
+      const hipMidX = (lHip.x + rHip.x) / 2, hipMidY = (lHip.y + rHip.y) / 2;
       measures.push(dist({ x: eyeMidX, y: eyeMidY }, { x: hipMidX, y: hipMidY }) / 3.5);
     }
-
-    const robustScale = median(measures);
-
-    return {
-      anchorX: eyeMidX,
-      anchorY: eyeMidY,
-      anchorScale: Math.max(1, robustScale),
-      mode: 'multi-anchor',
-    };
+    return { anchorX: eyeMidX, anchorY: eyeMidY, anchorScale: Math.max(1, median(measures)), mode: 'multi-anchor' };
   }
-
   if (shouldersGood) {
-    const shMidX = (lSh.x + rSh.x) / 2;
-    const shMidY = (lSh.y + rSh.y) / 2;
-    return {
-      anchorX: shMidX,
-      anchorY: shMidY,
-      anchorScale: Math.max(1, dist(lSh, rSh)),
-      mode: 'shoulders-only',
-    };
+    const shMidX = (lSh.x + rSh.x) / 2, shMidY = (lSh.y + rSh.y) / 2;
+    return { anchorX: shMidX, anchorY: shMidY, anchorScale: Math.max(1, dist(lSh, rSh)), mode: 'shoulders-only' };
   }
-
   if (eyesGood) {
-    const eyeMidX = (lEye.x + rEye.x) / 2;
-    const eyeMidY = (lEye.y + rEye.y) / 2;
-    return {
-      anchorX: eyeMidX,
-      anchorY: eyeMidY,
-      anchorScale: Math.max(1, dist(lEye, rEye)),
-      mode: 'eye-to-eye',
-    };
+    const eyeMidX = (lEye.x + rEye.x) / 2, eyeMidY = (lEye.y + rEye.y) / 2;
+    return { anchorX: eyeMidX, anchorY: eyeMidY, anchorScale: Math.max(1, dist(lEye, rEye)), mode: 'eye-to-eye' };
   }
-
   return null;
 }
-
-// -------- Detection orchestration --------
 
 export async function detectPoseForSlots(
   slots: AlignableSlot[],
@@ -311,71 +207,48 @@ export async function detectPoseForSlots(
     onProgress?.(`Detecting person ${i + 1}/${slots.length}…`);
     const slot = slots[i];
     const img = await decodeImage(slot.state.url);
-
     try {
       const pre = preprocess(img);
       const inputTensor = new ort.Tensor('float32', pre.data, [1, 3, INPUT_SIZE, INPUT_SIZE]);
-      const inputName = session.inputNames[0];
-      const outputName = session.outputNames[0];
+      const inputName = session.inputNames[0], outputName = session.outputNames[0];
       const feeds: Record<string, Tensor> = { [inputName]: inputTensor };
       const outputMap = await session.run(feeds);
       const output = outputMap[outputName];
-      const dims = output.dims;
       const data = output.data as Float32Array;
-      const numDetections = dims[2];
-
+      const numDetections = output.dims[2];
       const people = postprocess(data, numDetections, pre, img.naturalWidth, img.naturalHeight);
       console.log('[CompareShot] Slot', slot.slotIndex, '— person candidates:', people.length);
-
-      if (people.length === 0) {
-        results.push(null);
-        continue;
-      }
-
-      let best = people[0];
-      let bestArea = best.box.w * best.box.h;
+      if (people.length === 0) { results.push(null); continue; }
+      let best = people[0], bestArea = best.box.w * best.box.h;
       for (let k = 1; k < people.length; k++) {
         const a = people[k].box.w * people[k].box.h;
-        if (a > bestArea) {
-          best = people[k];
-          bestArea = a;
-        }
+        if (a > bestArea) { best = people[k]; bestArea = a; }
       }
-
       const anchor = extractAnchor(best);
-      if (!anchor) {
-        console.warn('[CompareShot] Slot', slot.slotIndex, '— no usable keypoints');
-        results.push(null);
-        continue;
-      }
-
-      // Normalize ALL anchor properties (position + scale) by image dimensions.
-      // This produces dimensionless values directly comparable across cameras
-      // with different sensor resolutions.
-      const W = img.naturalWidth;
-      const H = img.naturalHeight;
+      if (!anchor) { console.warn('[CompareShot] Slot', slot.slotIndex, '— no usable keypoints'); results.push(null); continue; }
+      const W = img.naturalWidth, H = img.naturalHeight;
       const longEdge = Math.max(W, H);
       const anchorXNorm = anchor.anchorX / W;
       const anchorYNorm = anchor.anchorY / H;
       const anchorScaleNorm = anchor.anchorScale / longEdge;
-
       console.log(
         '[CompareShot] Slot', slot.slotIndex,
         '— mode:', anchor.mode,
+        'natW×H:', W + '×' + H,
+        'anchorPx: (' + anchor.anchorX.toFixed(0) + ',' + anchor.anchorY.toFixed(0) + ')',
         'normPos: (' + anchorXNorm.toFixed(3) + ',' + anchorYNorm.toFixed(3) + ')',
         'normScale:', anchorScaleNorm.toFixed(4)
       );
-
       const sharpness = await imageSharpness(img);
-
       results.push({
         slotIndex: slot.slotIndex,
-        anchorXNorm,
-        anchorYNorm,
+        anchorXNorm, anchorYNorm,
         anchorScale: anchorScaleNorm,
         anchorMode: anchor.mode,
         detectionScore: best.score,
         sharpness,
+        naturalWidth: W,
+        naturalHeight: H,
       });
     } catch (err) {
       console.warn('[CompareShot] Pose detection failed for slot', slot.slotIndex, err);
@@ -385,8 +258,6 @@ export async function detectPoseForSlots(
   return results;
 }
 
-// -------- Reference selection --------
-
 function pickReference(poses: PoseData[]): number {
   if (poses.length === 0) return 0;
   const sN = normalize(poses.map((f) => f.sharpness));
@@ -394,73 +265,81 @@ function pickReference(poses: PoseData[]): number {
   const dN = normalize(poses.map((f) => f.detectionScore));
   const scores = poses.map((_, i) => 0.55 * hN[i] + 0.3 * sN[i] + 0.15 * dN[i]);
   let best = 0;
-  for (let i = 1; i < scores.length; i++) {
-    if (scores[i] > scores[best]) best = i;
-  }
+  for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
   return best;
 }
 
-// -------- Per-image transform --------
-
+/**
+ * Compute the per-image transform.
+ *
+ * Renderer convention (verified from exportRenderer.ts):
+ *   The image is drawn at "cover" size into the destination canvas, then:
+ *   1. translate(centerX + panX, centerY + panY)  — pan in CONTAINER pixels
+ *   2. scale(zoom)                                 — zoom multiplies cover
+ *   3. drawImage(img, -coverW/2, -coverH/2, coverW, coverH)
+ *
+ *   Net effect: a point at imagePixel (px, py) in the original image lands at:
+ *     screenX = centerX + panX + zoom × (px - W/2) × cover
+ *     screenY = centerY + panY + zoom × (py - H/2) × cover
+ *
+ * Anchor on screen, current image (no transforms): centerX + 0 + 1 × (anchorPx - W/2) × cover
+ * Anchor on screen, reference: centerX + 0 + 1 × (anchorRefPx - Wref/2) × coverRef
+ *
+ * We want: after applying our zoom/pan to current, the anchor lands at the
+ * SAME place on screen as the reference's anchor — and it has the same SIZE.
+ *
+ * Size: anchor's on-screen size = anchorScalePx × cover.
+ *   - Reference: refScaleNorm × refLongEdge × refCover
+ *   - Current:   curScaleNorm × curLongEdge × curCover × zoom
+ *   Setting equal → zoom = (refScaleNorm × refLongEdge × refCover) /
+ *                          (curScaleNorm × curLongEdge × curCover)
+ */
 function poseToTransform(
   current: PoseData,
   reference: PoseData,
   currentState: ImageState,
   referenceState: ImageState
 ): AlignTransform {
-  // Both anchorScale values are already normalized (anchor / longer-image-edge).
-  // Both images are independently fitted to the SAME container with `cover`,
-  // which means a person occupying X% of one image will appear larger in the
-  // container if cover-scaling is more aggressive. To compute the correct
-  // container-zoom multiplier so that the person ends up at the same size on
-  // screen, we compare the projected on-screen sizes.
-  //
-  // The on-screen size of the anchor in the reference is:
-  //   refOnScreenSize = reference.anchorScale * refLongEdge * refCover
-  // and the natural on-screen size of the anchor in the current image is:
-  //   curOnScreenSize = current.anchorScale * curLongEdge * curCover
-  // We want these equal after applying our zoom, so:
-  //   zoom = refOnScreenSize / curOnScreenSize
-
-  const refLongEdge = Math.max(referenceState.naturalWidth, referenceState.naturalHeight);
-  const curLongEdge = Math.max(currentState.naturalWidth, currentState.naturalHeight);
+  const refLongEdge = Math.max(reference.naturalWidth, reference.naturalHeight);
+  const curLongEdge = Math.max(current.naturalWidth, current.naturalHeight);
 
   const refCover = computeCoverScale(
-    referenceState.naturalWidth,
-    referenceState.naturalHeight,
-    referenceState._containerW,
-    referenceState._containerH
+    referenceState.naturalWidth, referenceState.naturalHeight,
+    referenceState._containerW, referenceState._containerH
   );
   const curCover = computeCoverScale(
-    currentState.naturalWidth,
-    currentState.naturalHeight,
-    currentState._containerW,
-    currentState._containerH
+    currentState.naturalWidth, currentState.naturalHeight,
+    currentState._containerW, currentState._containerH
   );
 
   const refOnScreenSize = reference.anchorScale * refLongEdge * refCover;
   const curOnScreenSize = current.anchorScale * curLongEdge * curCover;
   const zoom = refOnScreenSize / Math.max(1e-6, curOnScreenSize);
 
-  // Position: where on the container does each anchor land "naturally" (zoom=1, pan=0)?
-  // Anchor position in image-pixels: anchorXNorm * naturalWidth
-  // Offset from image center in image-pixels: anchorXNorm * naturalWidth - naturalWidth/2
-  // Project onto container: × cover scale
+  // Reference anchor offset from container center (no zoom needed for ref):
   const refOffsetX_container =
-    (reference.anchorXNorm - 0.5) * referenceState.naturalWidth * refCover;
+    (reference.anchorXNorm - 0.5) * reference.naturalWidth * refCover;
   const refOffsetY_container =
-    (reference.anchorYNorm - 0.5) * referenceState.naturalHeight * refCover;
+    (reference.anchorYNorm - 0.5) * reference.naturalHeight * refCover;
 
-  // After applying zoom, the current image's anchor will be at:
-  //   (anchorXNorm - 0.5) * curNaturalWidth * curCover * zoom
-  // We need to add panX so this matches refOffsetX_container.
+  // Current anchor offset from container center after applying zoom (no pan yet):
   const curAnchorOnContainerX =
-    (current.anchorXNorm - 0.5) * currentState.naturalWidth * curCover * zoom;
+    (current.anchorXNorm - 0.5) * current.naturalWidth * curCover * zoom;
   const curAnchorOnContainerY =
-    (current.anchorYNorm - 0.5) * currentState.naturalHeight * curCover * zoom;
+    (current.anchorYNorm - 0.5) * current.naturalHeight * curCover * zoom;
 
   let panX = refOffsetX_container - curAnchorOnContainerX;
   let panY = refOffsetY_container - curAnchorOnContainerY;
+
+  console.log(
+    '[CompareShot] Transform slot', current.slotIndex,
+    'zoom:', zoom.toFixed(3),
+    'panX:', panX.toFixed(1), 'panY:', panY.toFixed(1),
+    '| refOnScreen:', refOnScreenSize.toFixed(1),
+    'curOnScreen:', curOnScreenSize.toFixed(1),
+    '| refCover:', refCover.toFixed(4),
+    'curCover:', curCover.toFixed(4)
+  );
 
   let finalZoom = Math.max(0.2, Math.min(5, zoom));
 
@@ -472,6 +351,7 @@ function poseToTransform(
   const minZoom = Math.max(minZoomX, minZoomY);
   if (finalZoom < minZoom) {
     const k = minZoom / finalZoom;
+    console.log('[CompareShot]   auto-fill: bumping zoom from', finalZoom.toFixed(3), 'to', minZoom.toFixed(3), '(k=' + k.toFixed(3) + ')');
     finalZoom = minZoom;
     panX *= k;
     panY *= k;
@@ -481,35 +361,28 @@ function poseToTransform(
   return { zoom: finalZoom, panX, panY, rotation: 0 };
 }
 
-// -------- Public entry --------
-
 export async function poseAlign(
   slots: AlignableSlot[],
   detected: (PoseData | null)[],
   onProgress?: ProgressCallback
 ): Promise<SmartAlignReport> {
   const withPose: PoseData[] = [];
-  for (const f of detected) {
-    if (f) withPose.push(f);
-  }
-
+  for (const f of detected) if (f) withPose.push(f);
   if (withPose.length === 0) {
     return {
       mode: 'face',
       referenceSlotIndex: slots[0]?.slotIndex ?? 0,
-      results: slots.map((s) => ({
-        slotIndex: s.slotIndex,
-        status: 'failed',
-        reason: 'No person detected',
-      })),
+      results: slots.map((s) => ({ slotIndex: s.slotIndex, status: 'failed', reason: 'No person detected' })),
     };
   }
-
   onProgress?.('Choosing reference…');
   const refLocal = pickReference(withPose);
   const reference = withPose[refLocal];
   const referenceSlotIndex = reference.slotIndex;
   const refState = slots.find((s) => s.slotIndex === referenceSlotIndex)!.state;
+  console.log('[CompareShot] Reference slot:', referenceSlotIndex,
+    'normScale:', reference.anchorScale.toFixed(4),
+    'normPos:', '(' + reference.anchorXNorm.toFixed(3) + ',' + reference.anchorYNorm.toFixed(3) + ')');
 
   const results: AlignResult[] = [];
   for (let i = 0; i < slots.length; i++) {
@@ -520,27 +393,14 @@ export async function poseAlign(
     }
     const pose = detected[i];
     if (!pose) {
-      results.push({
-        slotIndex: slot.slotIndex,
-        status: 'failed',
-        reason: 'No person detected — will fall back to features',
-      });
+      results.push({ slotIndex: slot.slotIndex, status: 'failed', reason: 'No person detected — will fall back to features' });
       continue;
     }
     onProgress?.(`Aligning ${i + 1}/${slots.length}…`);
     const transform = poseToTransform(pose, reference, slot.state, refState);
-    results.push({
-      slotIndex: slot.slotIndex,
-      status: 'aligned',
-      transform,
-    });
+    results.push({ slotIndex: slot.slotIndex, status: 'aligned', transform });
   }
-
-  return {
-    mode: 'face',
-    referenceSlotIndex,
-    results,
-  };
+  return { mode: 'face', referenceSlotIndex, results };
 }
 
 export type { PoseData };
