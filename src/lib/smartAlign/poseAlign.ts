@@ -1,18 +1,13 @@
 /**
  * Pose-based Smart Align using YOLO11s-Pose via ONNX Runtime Web.
  *
- * Algorithm (after iteration & external review):
- *  1. Compute scaleMatchZoom per image so head-on-screen sizes match
- *     (relative scaling sacred — heads must end up the same size).
- *  2. Find a globalCropZoom in [1.0, 1.15] via binary search such that ALL
- *     images have a reachable common eye-Y position without black borders.
- *  3. Final zoom per image = scaleMatchZoom × globalCropZoom.
- *     This preserves scale ratios — heads stay equal size by construction.
- *  4. Target Y = median of all images' natural eye-Y positions, clamped into
- *     the feasible interval. Reference is informational only — it ALSO gets
- *     transformed (otherwise its scale would diverge from the others).
- *  5. Y-pan to hit target Y exactly, hard-clamped to reserve as final safety.
- *  6. X-pan analogous but with lower priority (larger tolerance).
+ * Algorithm:
+ *  1. scaleMatchZoom per image so heads end up the same on-screen size.
+ *  2. globalCropZoom (binary search ≤ 1.15) so all images can share a Y target.
+ *  3. finalZoom = scaleMatchZoom × globalCropZoom for ALL images including ref.
+ *  4. Pan limits scale with person-on-screen-size to avoid jarring shifts on
+ *     small subjects: max pan = K × personSize. Y is more permissive than X.
+ *  5. Hard clamp pans to reserves as final safety against black borders.
  */
 import type { Tensor } from 'onnxruntime-web';
 import { decodeImage } from '@/lib/exportRenderer';
@@ -31,6 +26,11 @@ const CONFIDENCE_THRESHOLD = 0.25;
 const KEYPOINT_VIS_THRESHOLD = 0.5;
 const MAX_GLOBAL_CROP = 1.15;
 const SAFETY_PX = 1;
+
+// Pan-limit multipliers (in units of person-on-screen-size).
+// Y is allowed more pan than X because eye-line alignment matters more.
+const MAX_PAN_X_FACTOR = 0.4;  // X-pan capped at 0.4 × personSize
+const MAX_PAN_Y_FACTOR = 1.0;  // Y-pan capped at 1.0 × personSize
 
 interface Keypoint { x: number; y: number; v: number; }
 interface Person { box: { x: number; y: number; w: number; h: number }; score: number; keypoints: Keypoint[]; }
@@ -353,7 +353,7 @@ export async function poseAlign(
   const reference = withPose[refLocal];
   const referenceSlotIndex = reference.slotIndex;
 
-  // ---- Step 1: Compute scaleMatchZoom for each slot ----
+  // ---- Step 1: scaleMatchZoom per slot (target = median on-screen size) ----
   const calcs: SlotCalc[] = withPose.map((p, i) => {
     const slot = slots.find((s) => s.slotIndex === p.slotIndex)!;
     const cover = computeCoverScale(
@@ -391,34 +391,30 @@ export async function poseAlign(
     );
   }
 
-  // ---- Step 2: Solve globalCropZoom ----
+  // ---- Step 2: globalCropZoom ----
   const globalCropZoom = solveGlobalCropZoom(calcs);
   console.log('[CompareShot] globalCropZoom:', globalCropZoom.toFixed(4));
 
-  // ---- Step 3: Compute final Y target ----
+  // ---- Step 3: Y-target ----
   const { lo: globalLoY, hi: globalHiY, perSlot } = computeFeasibleYInterval(calcs, globalCropZoom);
   const naturalEyeYs = perSlot.map((s) => s.baseY);
   const preferredY = median(naturalEyeYs);
   const targetY = clamp(preferredY, globalLoY, globalHiY);
-  const yIntervalEmpty = globalLoY > globalHiY;
   console.log(
-    '[CompareShot] Y-interval feasible:', !yIntervalEmpty,
+    '[CompareShot] Y-interval feasible:', globalLoY <= globalHiY,
     'lo:', globalLoY.toFixed(1), 'hi:', globalHiY.toFixed(1),
     'preferredY:', preferredY.toFixed(1),
     'targetY:', targetY.toFixed(1)
   );
 
-  // ---- Step 4: Compute final X target ----
+  // ---- Step 4: X-target ----
   const naturalEyeXs = calcs.map((c) => {
     const z = c.scaleMatchZoom * globalCropZoom;
     return (c.pose.anchorXNorm - 0.5) * c.pose.naturalWidth * c.cover * z;
   });
   const targetX = median(naturalEyeXs);
 
-  // ---- Step 5: Build per-image transforms (INCLUDING the reference!) ----
-  // Every slot — reference or not — gets its scaleMatchZoom × globalCropZoom
-  // and pan-to-target. This is the only way to keep all heads truly equal size.
-  // The reference is just a UX label now (which slot is "the chosen one").
+  // ---- Step 5: Per-image transforms with size-proportional pan limits ----
   const results: AlignResult[] = [];
   for (let i = 0; i < slots.length; i++) {
     const slot = slots[i];
@@ -443,6 +439,17 @@ export async function poseAlign(
     let panX = targetX - baseX;
     let panY = targetY - baseY;
 
+    // Person's on-screen size at finalZoom — used as the unit for pan limits.
+    const personSize = calc.pose.anchorScale * Math.max(calc.pose.naturalWidth, calc.pose.naturalHeight) * calc.cover * finalZoom;
+    const maxPanX = personSize * MAX_PAN_X_FACTOR;
+    const maxPanY = personSize * MAX_PAN_Y_FACTOR;
+
+    const panXBeforeSizeClamp = panX;
+    const panYBeforeSizeClamp = panY;
+
+    // Two-stage clamp: first to size-proportional limit, then to physical reserve.
+    panX = clamp(panX, -maxPanX, maxPanX);
+    panY = clamp(panY, -maxPanY, maxPanY);
     panX = clamp(panX, -reserveX, reserveX);
     panY = clamp(panY, -reserveY, reserveY);
 
@@ -451,13 +458,12 @@ export async function poseAlign(
       '[CompareShot] Transform slot', slot.slotIndex,
       isReference ? '(REFERENCE)' : '',
       'finalZoom:', finalZoom.toFixed(3),
-      '(scaleMatch:', calc.scaleMatchZoom.toFixed(3), '× globalCrop:', globalCropZoom.toFixed(3) + ')',
-      'panX:', panX.toFixed(1), 'panY:', panY.toFixed(1)
+      'panX:', panX.toFixed(1), '(was', panXBeforeSizeClamp.toFixed(1) + ', maxByPerson:', maxPanX.toFixed(0) + ')',
+      'panY:', panY.toFixed(1), '(was', panYBeforeSizeClamp.toFixed(1) + ', maxByPerson:', maxPanY.toFixed(0) + ')'
     );
 
     results.push({
       slotIndex: slot.slotIndex,
-      // Mark the reference for UX clarity, but it still has a transform applied
       status: isReference ? 'reference' : 'aligned',
       transform: { zoom: finalZoom, panX, panY, rotation: 0 },
     });
