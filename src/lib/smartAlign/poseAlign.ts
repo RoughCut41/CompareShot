@@ -1,17 +1,12 @@
 /**
- * Pose-based Smart Align using YOLO11n-Pose via ONNX Runtime Web.
+ * Pose-based Smart Align using YOLO11s-Pose via ONNX Runtime Web.
  *
  * Strategy:
  *  - Run YOLO11-Pose on every input image at 640×640 input resolution.
  *  - Pick the LARGEST detected person per image (closest to camera).
- *  - Use stable keypoint pairs as alignment anchors:
- *      Translation: midpoint of left_eye + right_eye
- *      Scale:       eye-to-shoulder-midpoint distance
- *    This is more robust than eye-to-chin (which face-detectors gave us)
- *    because shoulders are always present even when face is partially
- *    occluded, and the eye-shoulder distance is anatomically stable.
- *  - Fall back gracefully: if eyes are low-confidence but shoulders are
- *    high-confidence, use shoulder midpoint as anchor instead.
+ *  - Use multiple anatomical distances combined via median for a robust
+ *    scale metric. This avoids over-correcting when a single distance
+ *    happens to be off due to pose variation.
  *  - Auto-fill: bump zoom so no black borders appear.
  */
 import type { Tensor } from 'onnxruntime-web';
@@ -48,10 +43,10 @@ interface PoseData {
   /** Translation anchor in original image pixels */
   anchorX: number;
   anchorY: number;
-  /** Scale metric in original image pixels — anatomical reference distance */
+  /** Scale metric in original image pixels — robust median of multiple anatomical distances */
   anchorScale: number;
   /** Which anchor strategy was used (for diagnostics) */
-  anchorMode: 'eyes-to-shoulders' | 'shoulders-only' | 'eye-to-eye';
+  anchorMode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
   /** Detection confidence */
   detectionScore: number;
   /** Image sharpness (relative comparison only) */
@@ -118,7 +113,6 @@ function preprocess(img: HTMLImageElement): PreprocessedImage {
   const W = img.naturalWidth;
   const H = img.naturalHeight;
 
-  // Letterbox: scale so longest edge = INPUT_SIZE, then pad with gray
   const scale = INPUT_SIZE / Math.max(W, H);
   const newW = Math.round(W * scale);
   const newH = Math.round(H * scale);
@@ -129,13 +123,12 @@ function preprocess(img: HTMLImageElement): PreprocessedImage {
   canvas.width = INPUT_SIZE;
   canvas.height = INPUT_SIZE;
   const ctx = canvas.getContext('2d')!;
-  ctx.fillStyle = 'rgb(114, 114, 114)'; // YOLO standard letterbox color
+  ctx.fillStyle = 'rgb(114, 114, 114)';
   ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
   ctx.drawImage(img, padX, padY, newW, newH);
 
   const imageData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
 
-  // Convert RGBA → RGB and HWC → CHW, normalize to 0..1
   const float = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
   const planeSize = INPUT_SIZE * INPUT_SIZE;
   for (let i = 0; i < planeSize; i++) {
@@ -152,15 +145,6 @@ function preprocess(img: HTMLImageElement): PreprocessedImage {
 
 // -------- YOLO output postprocessing --------
 
-/**
- * Parse YOLO11-Pose output tensor [1, 56, 8400] into Person[] with
- * coordinates mapped back to the original image space.
- *
- * Output channels per detection:
- *   0..3: bbox (cx, cy, w, h) in 640×640 model space
- *   4:    person confidence
- *   5..55: 17 × (x, y, visibility) — keypoints in 640×640 model space
- */
 function postprocess(
   output: Float32Array,
   numDetections: number,
@@ -169,9 +153,6 @@ function postprocess(
   origH: number
 ): Person[] {
   const people: Person[] = [];
-  // Output is [1, 56, 8400] flattened. Channels are stored contiguously:
-  //   output[c * numDetections + i] = value of channel c for detection i
-
   const kpStartChannel = 5;
   const numKeypoints = 17;
 
@@ -179,7 +160,6 @@ function postprocess(
     const score = output[4 * numDetections + i];
     if (score < CONFIDENCE_THRESHOLD) continue;
 
-    // Decode bbox (model space → original image space)
     const cxModel = output[0 * numDetections + i];
     const cyModel = output[1 * numDetections + i];
     const wModel = output[2 * numDetections + i];
@@ -190,7 +170,6 @@ function postprocess(
     const wOrig = wModel / pre.scale;
     const hOrig = hModel / pre.scale;
 
-    // Decode keypoints
     const keypoints: Keypoint[] = [];
     for (let k = 0; k < numKeypoints; k++) {
       const xCh = kpStartChannel + k * 3;
@@ -216,7 +195,6 @@ function postprocess(
     });
   }
 
-  // Non-Maximum Suppression: keep only top non-overlapping detections
   return nms(people, 0.5).filter(
     (p) => p.box.x + p.box.w > 0 && p.box.y + p.box.h > 0 &&
            p.box.x < origW && p.box.y < origH
@@ -245,7 +223,7 @@ function nms(people: Person[], iouThreshold: number): Person[] {
   return kept;
 }
 
-// -------- Anchor extraction --------
+// -------- Anchor extraction (multi-anchor median strategy) --------
 
 function extractAnchor(
   person: Person
@@ -253,31 +231,70 @@ function extractAnchor(
   anchorX: number;
   anchorY: number;
   anchorScale: number;
-  mode: 'eyes-to-shoulders' | 'shoulders-only' | 'eye-to-eye';
+  mode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
 } | null {
   const kp = person.keypoints;
   const lEye = kp[KP.LEFT_EYE];
   const rEye = kp[KP.RIGHT_EYE];
+  const nose = kp[KP.NOSE];
   const lSh = kp[KP.LEFT_SHOULDER];
   const rSh = kp[KP.RIGHT_SHOULDER];
+  // Hips are COCO indices 11, 12
+  const lHip = kp[11];
+  const rHip = kp[12];
 
   const eyesGood = lEye.v > KEYPOINT_VIS_THRESHOLD && rEye.v > KEYPOINT_VIS_THRESHOLD;
   const shouldersGood = lSh.v > KEYPOINT_VIS_THRESHOLD && rSh.v > KEYPOINT_VIS_THRESHOLD;
+  const noseGood = nose.v > KEYPOINT_VIS_THRESHOLD;
+  const hipsGood =
+    lHip && rHip && lHip.v > KEYPOINT_VIS_THRESHOLD && rHip.v > KEYPOINT_VIS_THRESHOLD;
 
-  // Best case: both eyes and both shoulders confident → eye anchor + eye-to-shoulder scale
+  function dist(a: { x: number; y: number }, b: { x: number; y: number }): number {
+    return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+  }
+  function median(arr: number[]): number {
+    const s = arr.slice().sort((a, b) => a - b);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
+  }
+
+  // Best case: enough keypoints visible to combine multiple distance measures.
+  // Each measure has a different anatomical "weight". To make them comparable
+  // we normalize them to a common reference: "eye-to-shoulder" units.
+  // Typical human anatomical ratios (approximate, COCO-trained averages):
+  //   shoulder-width       ≈ 1.5 × eye-to-shoulder
+  //   eye-to-eye           ≈ 0.4 × eye-to-shoulder
+  //   nose-to-shoulder-mid ≈ 0.85 × eye-to-shoulder
+  //   eye-to-hip-mid       ≈ 3.5 × eye-to-shoulder
+  // We compute each available measure, divide by its expected ratio, and
+  // take the MEDIAN. Outliers (e.g. one mis-detected keypoint) are absorbed.
   if (eyesGood && shouldersGood) {
     const eyeMidX = (lEye.x + rEye.x) / 2;
     const eyeMidY = (lEye.y + rEye.y) / 2;
     const shMidX = (lSh.x + rSh.x) / 2;
     const shMidY = (lSh.y + rSh.y) / 2;
-    const dx = shMidX - eyeMidX;
-    const dy = shMidY - eyeMidY;
-    const eyeToShoulder = Math.sqrt(dx * dx + dy * dy);
+
+    const measures: number[] = [];
+    // Each measure is normalized to "eye-to-shoulder" units.
+    measures.push(dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY })); // 1.0×
+    measures.push(dist(lSh, rSh) / 1.5);
+    measures.push(dist(lEye, rEye) / 0.4);
+    if (noseGood) {
+      measures.push(dist(nose, { x: shMidX, y: shMidY }) / 0.85);
+    }
+    if (hipsGood) {
+      const hipMidX = (lHip.x + rHip.x) / 2;
+      const hipMidY = (lHip.y + rHip.y) / 2;
+      measures.push(dist({ x: eyeMidX, y: eyeMidY }, { x: hipMidX, y: hipMidY }) / 3.5);
+    }
+
+    const robustScale = median(measures);
+
     return {
       anchorX: eyeMidX,
       anchorY: eyeMidY,
-      anchorScale: Math.max(1, eyeToShoulder),
-      mode: 'eyes-to-shoulders',
+      anchorScale: Math.max(1, robustScale),
+      mode: 'multi-anchor',
     };
   }
 
@@ -285,9 +302,7 @@ function extractAnchor(
   if (shouldersGood) {
     const shMidX = (lSh.x + rSh.x) / 2;
     const shMidY = (lSh.y + rSh.y) / 2;
-    const dx = rSh.x - lSh.x;
-    const dy = rSh.y - lSh.y;
-    const shoulderWidth = Math.sqrt(dx * dx + dy * dy);
+    const shoulderWidth = dist(lSh, rSh);
     return {
       anchorX: shMidX,
       anchorY: shMidY,
@@ -300,9 +315,7 @@ function extractAnchor(
   if (eyesGood) {
     const eyeMidX = (lEye.x + rEye.x) / 2;
     const eyeMidY = (lEye.y + rEye.y) / 2;
-    const dx = rEye.x - lEye.x;
-    const dy = rEye.y - lEye.y;
-    const eyeWidth = Math.sqrt(dx * dx + dy * dy);
+    const eyeWidth = dist(lEye, rEye);
     return {
       anchorX: eyeMidX,
       anchorY: eyeMidY,
@@ -338,7 +351,7 @@ export async function detectPoseForSlots(
       const feeds: Record<string, Tensor> = { [inputName]: inputTensor };
       const outputMap = await session.run(feeds);
       const output = outputMap[outputName];
-      const dims = output.dims; // [1, 56, 8400]
+      const dims = output.dims;
       const data = output.data as Float32Array;
       const numDetections = dims[2];
 
@@ -350,7 +363,6 @@ export async function detectPoseForSlots(
         continue;
       }
 
-      // Pick the largest person (closest)
       let best = people[0];
       let bestArea = best.box.w * best.box.h;
       for (let k = 1; k < people.length; k++) {
@@ -367,7 +379,7 @@ export async function detectPoseForSlots(
         results.push(null);
         continue;
       }
-      console.log('[CompareShot] Slot', slot.slotIndex, '— mode:', anchor.mode);
+      console.log('[CompareShot] Slot', slot.slotIndex, '— mode:', anchor.mode, 'scale:', anchor.anchorScale.toFixed(1));
 
       const sharpness = await imageSharpness(img);
 
@@ -516,7 +528,7 @@ export async function poseAlign(
   }
 
   return {
-    mode: 'face', // We keep this string for backward compatibility with the UI
+    mode: 'face',
     referenceSlotIndex,
     results,
   };
