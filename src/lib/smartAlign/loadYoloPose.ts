@@ -13,7 +13,7 @@
 import type { InferenceSession } from 'onnxruntime-web';
 import { loadOrt } from './loadOrt';
 
-const MODEL_URL = '/models/yolo11n-pose.onnx';
+const MODEL_URL = '/models/yolo11s-pose.onnx';
 
 let sessionPromise: Promise<InferenceSession> | null = null;
 
