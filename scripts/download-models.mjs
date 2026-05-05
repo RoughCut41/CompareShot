@@ -1,12 +1,11 @@
 /**
  * Downloads ONNX models needed by Smart Align from GitHub Releases.
  *
- * GitHub Releases is a clean way to host large binaries — no LFS needed,
- * no 25 MB upload limit, files served via CDN. The release lives in our own
- * repo so we control versioning.
+ * GitHub Releases redirects to a signed S3 URL. We need to:
+ *  1) Send a User-Agent header (some GitHub endpoints return 404 without one)
+ *  2) Follow redirects manually so we can debug
  *
  * Runs automatically before `npm run build` and `npm run dev`.
- * Skips download if the file already exists and passes a size sanity check.
  */
 import { existsSync, mkdirSync, statSync, createWriteStream } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -28,6 +27,37 @@ if (!existsSync(MODELS_DIR)) {
   mkdirSync(MODELS_DIR, { recursive: true });
 }
 
+async function fetchWithRedirects(url, maxRedirects = 5) {
+  let currentUrl = url;
+  for (let i = 0; i < maxRedirects; i++) {
+    console.log(`[models] GET ${currentUrl}`);
+    const res = await fetch(currentUrl, {
+      redirect: 'manual',
+      headers: {
+        'User-Agent': 'CompareShot-Build/1.0',
+        Accept: 'application/octet-stream',
+      },
+    });
+    console.log(`[models]   → status ${res.status}`);
+    if (res.status >= 200 && res.status < 300) {
+      return res;
+    }
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location');
+      if (!location) {
+        throw new Error(`Redirect ${res.status} without Location header`);
+      }
+      console.log(`[models]   → redirect to ${location}`);
+      currentUrl = location;
+      continue;
+    }
+    // Not OK and not redirect
+    const body = await res.text().catch(() => '');
+    throw new Error(`Download failed: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ''}`);
+  }
+  throw new Error(`Too many redirects (>${maxRedirects})`);
+}
+
 async function downloadModel(model) {
   const dest = resolve(MODELS_DIR, model.name);
   if (existsSync(dest)) {
@@ -43,11 +73,8 @@ async function downloadModel(model) {
     );
   }
 
-  console.log(`[models] Downloading ${model.name} from ${model.url} …`);
-  const res = await fetch(model.url, { redirect: 'follow' });
-  if (!res.ok) {
-    throw new Error(`Download failed: ${res.status} ${res.statusText}`);
-  }
+  console.log(`[models] Downloading ${model.name} …`);
+  const res = await fetchWithRedirects(model.url);
   if (!res.body) {
     throw new Error('Response has no body');
   }
