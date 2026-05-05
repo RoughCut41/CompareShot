@@ -56,8 +56,13 @@ export default function App() {
       console.log('[CompareShot] Smart Align complete:', report);
       setLastAlignReport(report);
 
+      // Apply the computed transform to ALL slots that received one — including
+      // the reference slot. The "reference" status is now just a label for which
+      // slot was chosen as the anchor; mathematically the reference must also
+      // receive scaleMatchZoom × globalCropZoom + pan-to-target so heads stay
+      // at the same on-screen size as the others.
       for (const result of report.results) {
-        if (result.status === 'aligned' && result.transform) {
+        if ((result.status === 'aligned' || result.status === 'reference') && result.transform) {
           store.updateImage(result.slotIndex, {
             zoom: result.transform.zoom,
             panX: result.transform.panX,
@@ -67,17 +72,8 @@ export default function App() {
             flipV: false,
             freeRotateActive: false,
           });
-        } else if (result.status === 'reference') {
-          store.updateImage(result.slotIndex, {
-            zoom: 1,
-            panX: 0,
-            panY: 0,
-            rotation: 0,
-            flipH: false,
-            flipV: false,
-            freeRotateActive: false,
-          });
         }
+        // 'failed' results are left untouched — user can manually adjust.
       }
 
       const aligned = report.results.filter((r) => r.status === 'aligned').length;
@@ -100,7 +96,6 @@ export default function App() {
       }
       setLastAlignError(msg);
       setAlignStatus('Failed: ' + msg.slice(0, 30));
-      // Always release the button — no matter what
       window.setTimeout(() => {
         setAlignStatus(null);
         setAligning(false);
