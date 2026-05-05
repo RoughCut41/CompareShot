@@ -2,17 +2,17 @@
  * Pose-based Smart Align using YOLO11s-Pose via ONNX Runtime Web.
  *
  * Algorithm (after iteration & external review):
- *  1. Compute scaleMatchZoom per image so that head-on-screen sizes match
+ *  1. Compute scaleMatchZoom per image so head-on-screen sizes match
  *     (relative scaling sacred — heads must end up the same size).
  *  2. Find a globalCropZoom in [1.0, 1.15] via binary search such that ALL
  *     images have a reachable common eye-Y position without black borders.
  *  3. Final zoom per image = scaleMatchZoom × globalCropZoom.
  *     This preserves scale ratios — heads stay equal size by construction.
  *  4. Target Y = median of all images' natural eye-Y positions, clamped into
- *     the feasible interval. Reference is informational only.
+ *     the feasible interval. Reference is informational only — it ALSO gets
+ *     transformed (otherwise its scale would diverge from the others).
  *  5. Y-pan to hit target Y exactly, hard-clamped to reserve as final safety.
  *  6. X-pan analogous but with lower priority (larger tolerance).
- *  7. No more "auto-fill" zoom-bumping — globalCropZoom replaces it cleanly.
  */
 import type { Tensor } from 'onnxruntime-web';
 import { decodeImage } from '@/lib/exportRenderer';
@@ -29,8 +29,8 @@ import {
 const INPUT_SIZE = 640;
 const CONFIDENCE_THRESHOLD = 0.25;
 const KEYPOINT_VIS_THRESHOLD = 0.5;
-const MAX_GLOBAL_CROP = 1.15; // hard ceiling — won't crop more than 15%
-const SAFETY_PX = 1; // tiny margin against rounding-induced black borders
+const MAX_GLOBAL_CROP = 1.15;
+const SAFETY_PX = 1;
 
 interface Keypoint { x: number; y: number; v: number; }
 interface Person { box: { x: number; y: number; w: number; h: number }; score: number; keypoints: Keypoint[]; }
@@ -286,8 +286,6 @@ function pickReference(poses: PoseData[]): number {
   return best;
 }
 
-// ----- Per-image computed values used by the global solver -----
-
 interface SlotCalc {
   poseIdx: number;
   slotIndex: number;
@@ -410,21 +408,20 @@ export async function poseAlign(
     'targetY:', targetY.toFixed(1)
   );
 
-  // ---- Step 4: Compute final X target (lower priority) ----
+  // ---- Step 4: Compute final X target ----
   const naturalEyeXs = calcs.map((c) => {
     const z = c.scaleMatchZoom * globalCropZoom;
     return (c.pose.anchorXNorm - 0.5) * c.pose.naturalWidth * c.cover * z;
   });
   const targetX = median(naturalEyeXs);
 
-  // ---- Step 5: Build per-image transforms ----
+  // ---- Step 5: Build per-image transforms (INCLUDING the reference!) ----
+  // Every slot — reference or not — gets its scaleMatchZoom × globalCropZoom
+  // and pan-to-target. This is the only way to keep all heads truly equal size.
+  // The reference is just a UX label now (which slot is "the chosen one").
   const results: AlignResult[] = [];
   for (let i = 0; i < slots.length; i++) {
     const slot = slots[i];
-    if (slot.slotIndex === referenceSlotIndex) {
-      results.push({ slotIndex: slot.slotIndex, status: 'reference' });
-      continue;
-    }
     const pose = detected[i];
     if (!pose) {
       results.push({ slotIndex: slot.slotIndex, status: 'failed', reason: 'No person detected — will fall back to features' });
@@ -449,17 +446,19 @@ export async function poseAlign(
     panX = clamp(panX, -reserveX, reserveX);
     panY = clamp(panY, -reserveY, reserveY);
 
+    const isReference = slot.slotIndex === referenceSlotIndex;
     console.log(
       '[CompareShot] Transform slot', slot.slotIndex,
+      isReference ? '(REFERENCE)' : '',
       'finalZoom:', finalZoom.toFixed(3),
       '(scaleMatch:', calc.scaleMatchZoom.toFixed(3), '× globalCrop:', globalCropZoom.toFixed(3) + ')',
-      'panX:', panX.toFixed(1), 'panY:', panY.toFixed(1),
-      'reserveX:', reserveX.toFixed(0), 'reserveY:', reserveY.toFixed(0)
+      'panX:', panX.toFixed(1), 'panY:', panY.toFixed(1)
     );
 
     results.push({
       slotIndex: slot.slotIndex,
-      status: 'aligned',
+      // Mark the reference for UX clarity, but it still has a transform applied
+      status: isReference ? 'reference' : 'aligned',
       transform: { zoom: finalZoom, panX, panY, rotation: 0 },
     });
   }
