@@ -1,16 +1,22 @@
 /**
  * Face-based Smart Align using MediaPipe FaceLandmarker.
  *
- * Strategy:
- *  - Run MediaPipe at multiple scales for robustness on small faces.
- *  - Pick the largest face per image (closest person).
- *  - Two-point alignment using:
- *      Eye midpoint   — translation anchor (where the eyes should land)
- *      Eye-to-chin    — scale metric (head size)
- *    These are anatomically very stable across photos of the same person:
- *    eye landmarks are sub-pixel precise (iris detection), chin is structural,
- *    and the eye-to-chin distance barely changes with mimicry or lighting.
- *  - Auto-fill: bump zoom so no black borders appear.
+ * Robustness strategy:
+ *  - Render every input image to a fresh canvas before detection. This
+ *    normalizes EXIF orientation (which raw HTMLImageElement reading can get
+ *    wrong inside MediaPipe's WASM) and removes color-profile gotchas.
+ *  - Try multiple detection passes per image:
+ *      1) Whole image at 1500px max edge (best for normal-distance shots)
+ *      2) Whole image at 800px max edge (sometimes BlazeFace needs smaller)
+ *      3) Center-crop (50% of image around center) at 1000px (helps when the
+ *         subject is small but centered, which is the common smartphone case)
+ *    First successful detection wins.
+ *  - Track all 478 MediaPipe landmarks. Use iris-center landmarks (468, 473)
+ *    for the eye anchor and chin tip (152) for the head-size metric.
+ *
+ * Two-point alignment:
+ *    Eye midpoint (translation anchor) + eye-to-chin distance (scale).
+ *    Anatomically very stable across photos of the same person.
  */
 import type { FaceLandmarker, NormalizedLandmark } from '@mediapipe/tasks-vision';
 import { decodeImage } from '@/lib/exportRenderer';
@@ -24,12 +30,7 @@ import {
   SmartAlignReport,
 } from './types';
 
-// MediaPipe landmark indices for our two-point alignment:
-//   Iris (sub-pixel precise eye centers): 468 = left iris, 473 = right iris
-//   Chin tip: 152
-//
-// Iris landmarks come from MediaPipe's iris-tracking sub-model and are
-// extraordinarily stable. We use them directly as the eye centers.
+// MediaPipe landmark indices
 const LEFT_IRIS = 468;
 const RIGHT_IRIS = 473;
 const CHIN_TIP = 152;
@@ -37,10 +38,10 @@ const CHIN_TIP = 152;
 interface FaceData {
   slotIndex: number;
   img: HTMLImageElement;
-  /** Eye midpoint in image pixels — translation anchor */
+  /** Eye midpoint in original-image pixels — translation anchor */
   eyeMidX: number;
   eyeMidY: number;
-  /** Eye-to-chin distance in image pixels — scale metric */
+  /** Eye-to-chin distance in original-image pixels — scale metric */
   eyeToChin: number;
   detectionScore: number;
   sharpness: number;
@@ -92,46 +93,95 @@ function normalize(values: number[]): number[] {
   return values.map((v) => (v - mn) / (mx - mn));
 }
 
-// -------- Detection at multiple scales --------
+// -------- Multi-strategy detection --------
 
-interface RawDetection {
-  /** All 478 landmarks, scaled back to original image pixels */
-  landmarks: { x: number; y: number }[];
-  /** Approximate bounding box of the face (used for "largest face" selection) */
-  box: { x: number; y: number; w: number; h: number };
-  /** Pseudo-confidence proxy: face-area-to-image ratio (MediaPipe in IMAGE mode
-   *  doesn't expose a per-detection score directly, so we approximate). */
-  score: number;
+interface DetectionAttempt {
+  /** Friendly name for logging */
+  name: string;
+  /** The canvas we hand to MediaPipe */
+  canvas: HTMLCanvasElement;
+  /** Map a canvas-pixel coordinate back to original-image-pixel coordinate */
+  canvasToImage: (x: number, y: number) => { x: number; y: number };
 }
 
 /**
- * Run MediaPipe at multiple scales and merge detections. Mostly relevant for
- * very high-resolution images where downscaling helps the detector.
+ * Build the list of detection attempts for an image. Each attempt renders the
+ * source onto a canvas at a particular size/region; downstream we map
+ * coordinates back to original-image pixels.
  */
-function detectAtMultipleScales(
-  landmarker: FaceLandmarker,
-  img: HTMLImageElement
-): RawDetection[] {
-  // MediaPipe handles scaling internally and works best with the image as-is.
-  // We pass the HTMLImageElement directly. If detection fails, we'll log
-  // diagnostic info so we can see what's happening.
-  const all: RawDetection[] = [];
+function buildAttempts(img: HTMLImageElement): DetectionAttempt[] {
+  const W = img.naturalWidth;
+  const H = img.naturalHeight;
+
+  const makeFullScale = (maxDim: number, name: string): DetectionAttempt => {
+    const ratio = Math.min(1, maxDim / Math.max(W, H));
+    const cw = Math.max(1, Math.round(W * ratio));
+    const ch = Math.max(1, Math.round(H * ratio));
+    const canvas = document.createElement('canvas');
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(img, 0, 0, cw, ch);
+    return {
+      name,
+      canvas,
+      canvasToImage: (x, y) => ({ x: x / ratio, y: y / ratio }),
+    };
+  };
+
+  const makeCenterCrop = (cropFraction: number, maxDim: number, name: string): DetectionAttempt => {
+    // Take a center region of the image of size cropFraction * min(W,H)
+    const cropSize = Math.min(W, H) * cropFraction;
+    const cropW = Math.min(W, cropSize * (W / H) * 1.0);
+    const cropH = Math.min(H, cropSize);
+    const cropX = (W - cropW) / 2;
+    const cropY = (H - cropH) / 2;
+    const ratio = Math.min(1, maxDim / Math.max(cropW, cropH));
+    const cw = Math.max(1, Math.round(cropW * ratio));
+    const ch = Math.max(1, Math.round(cropH * ratio));
+    const canvas = document.createElement('canvas');
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, cw, ch);
+    return {
+      name,
+      canvas,
+      canvasToImage: (x, y) => ({
+        x: cropX + x / ratio,
+        y: cropY + y / ratio,
+      }),
+    };
+  };
+
+  return [
+    makeFullScale(1500, 'full@1500'),
+    makeFullScale(800, 'full@800'),
+    makeCenterCrop(0.7, 1000, 'center70@1000'),
+  ];
+}
+
+interface DetectedFace {
+  /** Landmarks already mapped back to original-image pixels */
+  landmarks: { x: number; y: number }[];
+  box: { x: number; y: number; w: number; h: number };
+  score: number;
+}
+
+function runDetection(landmarker: FaceLandmarker, attempt: DetectionAttempt): DetectedFace[] {
+  const out: DetectedFace[] = [];
   try {
-    console.log('[CompareShot] MediaPipe detect on', img.naturalWidth, '×', img.naturalHeight);
-    const result = landmarker.detect(img);
-    console.log('[CompareShot] MediaPipe result:', {
-      hasResult: !!result,
-      faceLandmarksCount: result?.faceLandmarks?.length ?? 0,
-    });
+    const result = landmarker.detect(attempt.canvas);
     if (!result.faceLandmarks || result.faceLandmarks.length === 0) {
-      return all;
+      return out;
     }
     for (const face of result.faceLandmarks) {
-      // MediaPipe returns normalized [0, 1] coordinates — multiply by image size
-      const lms = face.map((p: NormalizedLandmark) => ({
-        x: p.x * img.naturalWidth,
-        y: p.y * img.naturalHeight,
-      }));
+      // MediaPipe gives normalized [0..1] coords relative to the canvas
+      const lms = face.map((p: NormalizedLandmark) => {
+        const cx = p.x * attempt.canvas.width;
+        const cy = p.y * attempt.canvas.height;
+        return attempt.canvasToImage(cx, cy);
+      });
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       for (const p of lms) {
         if (p.x < minX) minX = p.x;
@@ -139,42 +189,16 @@ function detectAtMultipleScales(
         if (p.x > maxX) maxX = p.x;
         if (p.y > maxY) maxY = p.y;
       }
-      const w = maxX - minX;
-      const h = maxY - minY;
-      const score = (w * h) / (img.naturalWidth * img.naturalHeight);
-      all.push({
+      out.push({
         landmarks: lms,
-        box: { x: minX, y: minY, w, h },
-        score,
+        box: { x: minX, y: minY, w: maxX - minX, h: maxY - minY },
+        score: 1,
       });
     }
   } catch (err) {
-    console.warn('[CompareShot] MediaPipe detection failed:', err);
+    console.warn('[CompareShot] detection threw on', attempt.name, err);
   }
-  return all;
-}
-
-/** Suppress duplicate detections across scales by IoU. */
-function dedupeDetections(dets: RawDetection[]): RawDetection[] {
-  const sorted = dets.slice().sort((a, b) => b.box.w * b.box.h - a.box.w * a.box.h);
-  const kept: RawDetection[] = [];
-  for (const d of sorted) {
-    let dup = false;
-    for (const k of kept) {
-      const x1 = Math.max(d.box.x, k.box.x);
-      const y1 = Math.max(d.box.y, k.box.y);
-      const x2 = Math.min(d.box.x + d.box.w, k.box.x + k.box.w);
-      const y2 = Math.min(d.box.y + d.box.h, k.box.y + k.box.h);
-      const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-      const union = d.box.w * d.box.h + k.box.w * k.box.h - inter;
-      if (union > 0 && inter / union > 0.4) {
-        dup = true;
-        break;
-      }
-    }
-    if (!dup) kept.push(d);
-  }
-  return kept;
+  return out;
 }
 
 export async function detectFacesForSlots(
@@ -190,54 +214,68 @@ export async function detectFacesForSlots(
     const slot = slots[i];
     const img = await decodeImage(slot.state.url);
 
-    try {
-      const raw = detectAtMultipleScales(landmarker, img);
-      const merged = dedupeDetections(raw);
-      console.log('[CompareShot] Slot', slot.slotIndex, '— face candidates:', merged.length);
-
-      if (merged.length === 0) {
-        results.push(null);
-        continue;
-      }
-
-      // Pick the largest face (closest person)
-      let best = merged[0];
-      let bestArea = best.box.w * best.box.h;
-      for (let k = 1; k < merged.length; k++) {
-        const a = merged[k].box.w * merged[k].box.h;
-        if (a > bestArea) {
-          best = merged[k];
-          bestArea = a;
-        }
-      }
-
-      // Iris landmarks are MediaPipe's most stable points — they come from the
-      // iris-tracking sub-model and are sub-pixel precise.
-      const leftIris = best.landmarks[LEFT_IRIS];
-      const rightIris = best.landmarks[RIGHT_IRIS];
-      const chin = best.landmarks[CHIN_TIP];
-
-      const eyeMidX = (leftIris.x + rightIris.x) / 2;
-      const eyeMidY = (leftIris.y + rightIris.y) / 2;
-      const eyeToChin = Math.sqrt(
-        (chin.x - eyeMidX) ** 2 + (chin.y - eyeMidY) ** 2
+    const attempts = buildAttempts(img);
+    let detected: DetectedFace[] = [];
+    let usedAttempt = '';
+    for (const att of attempts) {
+      detected = runDetection(landmarker, att);
+      console.log(
+        '[CompareShot] Slot', slot.slotIndex,
+        '— attempt', att.name,
+        'on', att.canvas.width, '×', att.canvas.height,
+        '→ found', detected.length
       );
-
-      const sharpness = await imageSharpness(img);
-
-      results.push({
-        slotIndex: slot.slotIndex,
-        img,
-        eyeMidX,
-        eyeMidY,
-        eyeToChin: Math.max(1, eyeToChin),
-        detectionScore: best.score,
-        sharpness,
-      });
-    } catch (err) {
-      console.warn('[CompareShot] Face detection failed for slot', slot.slotIndex, err);
-      results.push(null);
+      if (detected.length > 0) {
+        usedAttempt = att.name;
+        break;
+      }
     }
+
+    if (detected.length === 0) {
+      console.warn('[CompareShot] Slot', slot.slotIndex, '— no face after all attempts');
+      results.push(null);
+      continue;
+    }
+    console.log('[CompareShot] Slot', slot.slotIndex, '— used:', usedAttempt);
+
+    // Pick the largest face (closest person)
+    let best = detected[0];
+    let bestArea = best.box.w * best.box.h;
+    for (let k = 1; k < detected.length; k++) {
+      const a = detected[k].box.w * detected[k].box.h;
+      if (a > bestArea) {
+        best = detected[k];
+        bestArea = a;
+      }
+    }
+
+    const leftIris = best.landmarks[LEFT_IRIS];
+    const rightIris = best.landmarks[RIGHT_IRIS];
+    const chin = best.landmarks[CHIN_TIP];
+
+    if (!leftIris || !rightIris || !chin) {
+      console.warn('[CompareShot] Slot', slot.slotIndex, '— landmarks incomplete');
+      results.push(null);
+      continue;
+    }
+
+    const eyeMidX = (leftIris.x + rightIris.x) / 2;
+    const eyeMidY = (leftIris.y + rightIris.y) / 2;
+    const eyeToChin = Math.sqrt(
+      (chin.x - eyeMidX) ** 2 + (chin.y - eyeMidY) ** 2
+    );
+
+    const sharpness = await imageSharpness(img);
+
+    results.push({
+      slotIndex: slot.slotIndex,
+      img,
+      eyeMidX,
+      eyeMidY,
+      eyeToChin: Math.max(1, eyeToChin),
+      detectionScore: best.score,
+      sharpness,
+    });
   }
   return results;
 }
@@ -247,7 +285,6 @@ export async function detectFacesForSlots(
 function pickFaceReference(faces: FaceData[]): number {
   if (faces.length === 0) return 0;
   const sN = normalize(faces.map((f) => f.sharpness));
-  // Use eye-to-chin (head size) as the centrality / closeness proxy
   const hN = normalize(faces.map((f) => f.eyeToChin));
   const dN = normalize(faces.map((f) => f.detectionScore));
   const scores = faces.map((_, i) => 0.55 * hN[i] + 0.3 * sN[i] + 0.15 * dN[i]);
@@ -266,7 +303,6 @@ function faceDataToTransform(
   currentState: ImageState,
   referenceState: ImageState
 ): AlignTransform {
-  // Match the eye-to-chin distance: this is our "head size" measurement
   const imageScale = reference.eyeToChin / Math.max(1, current.eyeToChin);
 
   const refCover = computeCoverScale(
@@ -284,7 +320,6 @@ function faceDataToTransform(
 
   const zoom = (refCover * imageScale) / curCover;
 
-  // Eye midpoint offsets from each image's natural center
   const refOffsetX_refImg = reference.eyeMidX - referenceState.naturalWidth / 2;
   const refOffsetY_refImg = reference.eyeMidY - referenceState.naturalHeight / 2;
   const refOffsetX_container = refOffsetX_refImg * refCover;
@@ -300,7 +335,6 @@ function faceDataToTransform(
 
   let finalZoom = Math.max(0.2, Math.min(5, zoom));
 
-  // Auto-fill against black borders
   const cw = currentState._containerW > 0 ? currentState._containerW : 960;
   const ch = currentState._containerH > 0 ? currentState._containerH : 1625;
   const minZoomX = 1 + (2 * Math.abs(panX)) / cw;
