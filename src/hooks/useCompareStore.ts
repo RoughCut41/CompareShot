@@ -46,7 +46,6 @@ export function useCompareStore() {
     [data, activeCategory, activeIndex]
   );
 
-  /** Patch the active comparison with a partial or updater. */
   const patchActiveComparison = useCallback(
     (patcher: (c: Comparison) => Comparison) => {
       setData((prev) => {
@@ -64,7 +63,6 @@ export function useCompareStore() {
     [activeCategory, activeIndex]
   );
 
-  /** Update a single image slot in the active comparison. */
   const updateImage = useCallback(
     (slotIndex: number, updater: ImageUpdater) => {
       patchActiveComparison((c) => {
@@ -79,12 +77,10 @@ export function useCompareStore() {
     [patchActiveComparison]
   );
 
-  /** Set a slot's image to a new ImageState (or null to clear). */
   const setSlotImage = useCallback(
     (slotIndex: number, state: ImageState | null) => {
       patchActiveComparison((c) => {
         const prev = c.images[slotIndex];
-        // Dispose the previous image's object URL if replacing
         if (prev && prev !== state) disposeImage(prev);
         const newImages = c.images.slice();
         newImages[slotIndex] = state;
@@ -94,7 +90,6 @@ export function useCompareStore() {
     [patchActiveComparison]
   );
 
-  /** Delete (clear) a slot's image. */
   const deleteImage = useCallback(
     (slotIndex: number) => {
       setSlotImage(slotIndex, null);
@@ -102,7 +97,6 @@ export function useCompareStore() {
     [setSlotImage]
   );
 
-  /** Add a new empty slot to the active comparison (max MAX_SLOTS). */
   const addSlot = useCallback(() => {
     patchActiveComparison((c) => {
       if (c.images.length >= MAX_SLOTS) return c;
@@ -110,7 +104,6 @@ export function useCompareStore() {
     });
   }, [patchActiveComparison]);
 
-  /** Remove the last slot from the active comparison (min MIN_SLOTS). */
   const removeSlot = useCallback(() => {
     patchActiveComparison((c) => {
       if (c.images.length <= MIN_SLOTS) return c;
@@ -120,12 +113,10 @@ export function useCompareStore() {
     });
   }, [patchActiveComparison]);
 
-  /** Switch to another category tab. */
   const switchCategory = useCallback((cat: Category) => {
     setActiveCategory(cat);
   }, []);
 
-  /** Switch to another comparison tab within the active category. */
   const switchComparison = useCallback(
     (idx: number) => {
       setActiveIndex((prev) => ({ ...prev, [activeCategory]: idx }));
@@ -133,7 +124,6 @@ export function useCompareStore() {
     [activeCategory]
   );
 
-  /** Create a new comparison in the active category. */
   const createComparison = useCallback(() => {
     let newIndex = 0;
     setData((prev) => {
@@ -142,26 +132,22 @@ export function useCompareStore() {
       newIndex = list.length;
       return { ...prev, [activeCategory]: [...list, newComp] };
     });
-    // Activate the newly created comparison
     setActiveIndex((prev) => ({
       ...prev,
       [activeCategory]: newIndex,
     }));
   }, [activeCategory]);
 
-  /** Delete a comparison by index in the active category. */
   const deleteComparison = useCallback(
     (idx: number) => {
       setData((prev) => {
         const list = prev[activeCategory];
-        if (list.length <= 1) return prev; // keep at least one
-        // Dispose images in the comparison being deleted
+        if (list.length <= 1) return prev;
         list[idx]?.images.forEach((img) => disposeImage(img));
         const newList = list.slice();
         newList.splice(idx, 1);
         return { ...prev, [activeCategory]: newList };
       });
-      // Adjust active index if needed
       setActiveIndex((prev) => {
         const cur = prev[activeCategory];
         const newCur = cur >= idx && cur > 0 ? cur - 1 : cur;
@@ -171,10 +157,8 @@ export function useCompareStore() {
     [activeCategory]
   );
 
-  /** Reset all images in all categories. */
   const deleteAllPhotos = useCallback(() => {
     setData((prev) => {
-      // Dispose every image
       for (const cat of CATEGORIES) {
         for (const c of prev[cat]) {
           c.images.forEach((img) => disposeImage(img));
@@ -183,6 +167,31 @@ export function useCompareStore() {
       return makeInitialData();
     });
     setActiveIndex(makeInitialActiveIndex());
+  }, []);
+
+  /**
+   * Replace the entire app state with new data (used by folder import).
+   * Disposes all existing image URLs to prevent memory leaks before swapping.
+   */
+  const replaceAllData = useCallback((newData: CategoryData) => {
+    setData((prev) => {
+      // Dispose every existing image URL
+      for (const cat of CATEGORIES) {
+        for (const c of prev[cat]) {
+          c.images.forEach((img) => disposeImage(img));
+        }
+      }
+      return newData;
+    });
+    setActiveIndex(makeInitialActiveIndex());
+    // Switch to first category that has content
+    for (const cat of CATEGORIES) {
+      if (newData[cat]?.[0]?.images.some((i) => i !== null)) {
+        setActiveCategory(cat);
+        return;
+      }
+    }
+    setActiveCategory('wide');
   }, []);
 
   return {
@@ -200,6 +209,7 @@ export function useCompareStore() {
     addSlot,
     removeSlot,
     deleteAllPhotos,
+    replaceAllData,
   };
 }
 
