@@ -29,7 +29,6 @@ interface PoseData {
   anchorMode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
   detectionScore: number;
   sharpness: number;
-  // Capture image dimensions at detection time so we can debug later
   naturalWidth: number;
   naturalHeight: number;
 }
@@ -235,7 +234,6 @@ export async function detectPoseForSlots(
         '[CompareShot] Slot', slot.slotIndex,
         '— mode:', anchor.mode,
         'natW×H:', W + '×' + H,
-        'anchorPx: (' + anchor.anchorX.toFixed(0) + ',' + anchor.anchorY.toFixed(0) + ')',
         'normPos: (' + anchorXNorm.toFixed(3) + ',' + anchorYNorm.toFixed(3) + ')',
         'normScale:', anchorScaleNorm.toFixed(4)
       );
@@ -269,31 +267,6 @@ function pickReference(poses: PoseData[]): number {
   return best;
 }
 
-/**
- * Compute the per-image transform.
- *
- * Renderer convention (verified from exportRenderer.ts):
- *   The image is drawn at "cover" size into the destination canvas, then:
- *   1. translate(centerX + panX, centerY + panY)  — pan in CONTAINER pixels
- *   2. scale(zoom)                                 — zoom multiplies cover
- *   3. drawImage(img, -coverW/2, -coverH/2, coverW, coverH)
- *
- *   Net effect: a point at imagePixel (px, py) in the original image lands at:
- *     screenX = centerX + panX + zoom × (px - W/2) × cover
- *     screenY = centerY + panY + zoom × (py - H/2) × cover
- *
- * Anchor on screen, current image (no transforms): centerX + 0 + 1 × (anchorPx - W/2) × cover
- * Anchor on screen, reference: centerX + 0 + 1 × (anchorRefPx - Wref/2) × coverRef
- *
- * We want: after applying our zoom/pan to current, the anchor lands at the
- * SAME place on screen as the reference's anchor — and it has the same SIZE.
- *
- * Size: anchor's on-screen size = anchorScalePx × cover.
- *   - Reference: refScaleNorm × refLongEdge × refCover
- *   - Current:   curScaleNorm × curLongEdge × curCover × zoom
- *   Setting equal → zoom = (refScaleNorm × refLongEdge × refCover) /
- *                          (curScaleNorm × curLongEdge × curCover)
- */
 function poseToTransform(
   current: PoseData,
   reference: PoseData,
@@ -316,13 +289,11 @@ function poseToTransform(
   const curOnScreenSize = current.anchorScale * curLongEdge * curCover;
   const zoom = refOnScreenSize / Math.max(1e-6, curOnScreenSize);
 
-  // Reference anchor offset from container center (no zoom needed for ref):
   const refOffsetX_container =
     (reference.anchorXNorm - 0.5) * reference.naturalWidth * refCover;
   const refOffsetY_container =
     (reference.anchorYNorm - 0.5) * reference.naturalHeight * refCover;
 
-  // Current anchor offset from container center after applying zoom (no pan yet):
   const curAnchorOnContainerX =
     (current.anchorXNorm - 0.5) * current.naturalWidth * curCover * zoom;
   const curAnchorOnContainerY =
@@ -331,24 +302,33 @@ function poseToTransform(
   let panX = refOffsetX_container - curAnchorOnContainerX;
   let panY = refOffsetY_container - curAnchorOnContainerY;
 
+  let finalZoom = Math.max(0.2, Math.min(5, zoom));
+
+  // Auto-fill against black borders.
+  // The image is drawn at size (natW × cover × zoom) × (natH × cover × zoom).
+  // Container has size (cw, ch). The "reserve" — how far we can pan before
+  // black borders appear — is:
+  //   reserveX = (natW × cover × zoom - cw) / 2
+  //   reserveY = (natH × cover × zoom - ch) / 2
+  // We want |panX| ≤ reserveX, so:
+  //   zoomMin = (cw + 2|panX|) / (natW × cover)
+  //   zoomMin = (ch + 2|panY|) / (natH × cover)
+  // Take the max — only bump zoom if BOTH dimensions need it.
+  const cw = currentState._containerW > 0 ? currentState._containerW : 960;
+  const ch = currentState._containerH > 0 ? currentState._containerH : 1625;
+  const natW = current.naturalWidth, natH = current.naturalHeight;
+  const minZoomX = (cw + 2 * Math.abs(panX)) / (natW * curCover);
+  const minZoomY = (ch + 2 * Math.abs(panY)) / (natH * curCover);
+  const minZoom = Math.max(minZoomX, minZoomY);
+
   console.log(
     '[CompareShot] Transform slot', current.slotIndex,
     'zoom:', zoom.toFixed(3),
     'panX:', panX.toFixed(1), 'panY:', panY.toFixed(1),
-    '| refOnScreen:', refOnScreenSize.toFixed(1),
-    'curOnScreen:', curOnScreenSize.toFixed(1),
-    '| refCover:', refCover.toFixed(4),
-    'curCover:', curCover.toFixed(4)
+    '| minZoomX:', minZoomX.toFixed(3),
+    'minZoomY:', minZoomY.toFixed(3)
   );
 
-  let finalZoom = Math.max(0.2, Math.min(5, zoom));
-
-  // Auto-fill against black borders
-  const cw = currentState._containerW > 0 ? currentState._containerW : 960;
-  const ch = currentState._containerH > 0 ? currentState._containerH : 1625;
-  const minZoomX = 1 + (2 * Math.abs(panX)) / cw;
-  const minZoomY = 1 + (2 * Math.abs(panY)) / ch;
-  const minZoom = Math.max(minZoomX, minZoomY);
   if (finalZoom < minZoom) {
     const k = minZoom / finalZoom;
     console.log('[CompareShot]   auto-fill: bumping zoom from', finalZoom.toFixed(3), 'to', minZoom.toFixed(3), '(k=' + k.toFixed(3) + ')');
@@ -380,9 +360,7 @@ export async function poseAlign(
   const reference = withPose[refLocal];
   const referenceSlotIndex = reference.slotIndex;
   const refState = slots.find((s) => s.slotIndex === referenceSlotIndex)!.state;
-  console.log('[CompareShot] Reference slot:', referenceSlotIndex,
-    'normScale:', reference.anchorScale.toFixed(4),
-    'normPos:', '(' + reference.anchorXNorm.toFixed(3) + ',' + reference.anchorYNorm.toFixed(3) + ')');
+  console.log('[CompareShot] Reference slot:', referenceSlotIndex);
 
   const results: AlignResult[] = [];
   for (let i = 0; i < slots.length; i++) {
