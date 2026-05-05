@@ -114,45 +114,57 @@ function buildAttempts(img: HTMLImageElement): DetectionAttempt[] {
   const H = img.naturalHeight;
 
   const makeFullScale = (maxDim: number, name: string): DetectionAttempt => {
-    const ratio = Math.min(1, maxDim / Math.max(W, H));
-    const cw = Math.max(1, Math.round(W * ratio));
-    const ch = Math.max(1, Math.round(H * ratio));
-    const canvas = document.createElement('canvas');
-    canvas.width = cw;
-    canvas.height = ch;
-    const ctx = canvas.getContext('2d')!;
-    ctx.drawImage(img, 0, 0, cw, ch);
-    return {
-      name,
-      canvas,
-      canvasToImage: (x, y) => ({ x: x / ratio, y: y / ratio }),
-    };
+  // Render the full image into a SQUARE canvas with black letterboxing.
+  // This makes the ROI square — required for MediaPipe to project landmarks
+  // accurately — while still containing the entire source image.
+  const longest = Math.max(W, H);
+  const ratio = Math.min(1, maxDim / longest);
+  const targetSize = Math.max(1, Math.round(longest * ratio));
+  const drawW = Math.max(1, Math.round(W * ratio));
+  const drawH = Math.max(1, Math.round(H * ratio));
+  const offsetX = (targetSize - drawW) / 2;
+  const offsetY = (targetSize - drawH) / 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = targetSize;
+  canvas.height = targetSize;
+  const ctx = canvas.getContext('2d')!;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, targetSize, targetSize);
+  ctx.drawImage(img, 0, 0, W, H, offsetX, offsetY, drawW, drawH);
+  return {
+    name,
+    canvas,
+    canvasToImage: (x, y) => ({
+      x: (x - offsetX) / ratio,
+      y: (y - offsetY) / ratio,
+    }),
   };
+};
 
-  const makeCenterCrop = (cropFraction: number, maxDim: number, name: string): DetectionAttempt => {
-    // Take a center region of the image of size cropFraction * min(W,H)
-    const cropSize = Math.min(W, H) * cropFraction;
-    const cropW = Math.min(W, cropSize * (W / H) * 1.0);
-    const cropH = Math.min(H, cropSize);
-    const cropX = (W - cropW) / 2;
-    const cropY = (H - cropH) / 2;
-    const ratio = Math.min(1, maxDim / Math.max(cropW, cropH));
-    const cw = Math.max(1, Math.round(cropW * ratio));
-    const ch = Math.max(1, Math.round(cropH * ratio));
-    const canvas = document.createElement('canvas');
-    canvas.width = cw;
-    canvas.height = ch;
-    const ctx = canvas.getContext('2d')!;
-    ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, cw, ch);
-    return {
-      name,
-      canvas,
-      canvasToImage: (x, y) => ({
-        x: cropX + x / ratio,
-        y: cropY + y / ratio,
-      }),
-    };
+const makeCenterCrop = (cropFraction: number, maxDim: number, name: string): DetectionAttempt => {
+  // Square crop centered on the image — MediaPipe's landmark projection emits
+  // a warning for non-square ROIs ("NORM_RECT without IMAGE_DIMENSIONS is only
+  // supported for the square ROI"), and produces inaccurate landmarks. Using
+  // a square crop avoids this entirely.
+  const side = Math.min(W, H) * cropFraction;
+  const cropX = (W - side) / 2;
+  const cropY = (H - side) / 2;
+  const ratio = Math.min(1, maxDim / side);
+  const csize = Math.max(1, Math.round(side * ratio));
+  const canvas = document.createElement('canvas');
+  canvas.width = csize;
+  canvas.height = csize;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, cropX, cropY, side, side, 0, 0, csize, csize);
+  return {
+    name,
+    canvas,
+    canvasToImage: (x, y) => ({
+      x: cropX + x / ratio,
+      y: cropY + y / ratio,
+    }),
   };
+};
 
   return [
     makeFullScale(1500, 'full@1500'),
