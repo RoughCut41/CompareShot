@@ -2,16 +2,14 @@
  * Hybrid Smart Align orchestrator.
  *
  * Strategy:
- *  1. Try face detection on every loaded image.
- *  2. If at least HALF of the loaded images have a detected face, run the
- *     face-based pipeline. Slots in face mode that have no detected face will
- *     be re-aligned via feature-matching as a fallback (so a single failed
- *     detection doesn't block the whole comparison).
- *  3. Otherwise, run feature matching for everything in a Web Worker so
- *     OpenCV.js never blocks the UI thread.
+ *  1. Run YOLO11n-Pose on all loaded images.
+ *  2. If at least HALF the images have a detected person, use pose mode.
+ *     Slots without a detected person fall back to feature matching.
+ *  3. Otherwise, run feature matching (AKAZE in worker — kept as fallback
+ *     until SuperPoint+LightGlue is integrated in phase 3).
  */
 import { ImageState } from '@/lib/types';
-import { detectFacesForSlots, faceAlign } from './faceAlign';
+import { detectPoseForSlots, poseAlign } from './poseAlign';
 import { featureAlignViaWorker } from './workerClient';
 import { AlignableSlot, AlignResult, ProgressCallback, SmartAlignReport } from './types';
 
@@ -36,49 +34,42 @@ export async function smartAlign({ images, onProgress }: SmartAlignInput): Promi
     };
   }
 
-  // ---- Phase A: Try face detection ----
-  let faceDetections: Awaited<ReturnType<typeof detectFacesForSlots>> = [];
+  // ---- Phase A: Try pose detection ----
+  let poseDetections: Awaited<ReturnType<typeof detectPoseForSlots>> = [];
   try {
-    faceDetections = await detectFacesForSlots(slots, onProgress);
+    poseDetections = await detectPoseForSlots(slots, onProgress);
   } catch (err) {
-    console.warn('[CompareShot] Face detection failed, falling back to features:', err);
+    console.warn('[CompareShot] Pose detection failed entirely:', err);
   }
 
-  const facesFound = faceDetections.filter((f) => f !== null).length;
-  const useFaceMode = facesFound >= Math.ceil(slots.length / 2);
-  console.log('[CompareShot] Face detections:', facesFound, '/', slots.length, '— face mode:', useFaceMode);
+  const peopleFound = poseDetections.filter((p) => p !== null).length;
+  const usePoseMode = peopleFound >= Math.ceil(slots.length / 2);
+  console.log('[CompareShot] Persons detected:', peopleFound, '/', slots.length, '— pose mode:', usePoseMode);
 
-  if (useFaceMode) {
-    const faceReport = await faceAlign(slots, faceDetections, onProgress);
+  if (usePoseMode) {
+    const poseReport = await poseAlign(slots, poseDetections, onProgress);
 
-    // Identify slots that face mode could not align (no face detected)
+    // Identify slots that need feature fallback (no person detected)
     const fallbackSlotIndices = new Set<number>();
-    for (const r of faceReport.results) {
+    for (const r of poseReport.results) {
       if (r.status === 'failed' && r.reason && r.reason.includes('fall back')) {
         fallbackSlotIndices.add(r.slotIndex);
       }
     }
 
     if (fallbackSlotIndices.size === 0) {
-      return faceReport;
+      return poseReport;
     }
 
-    // ---- Feature fallback for slots without a detected face ----
-    // We need to feature-align those slots against the SAME reference image
-    // that face-align used, so the final positions are consistent with the
-    // face-aligned slots. We run featureAlignViaWorker on a sub-list:
-    //   [reference slot, ...fallback slots]
-    onProgress?.('Aligning faceless slots via features…');
-    const refSlot = slots.find((s) => s.slotIndex === faceReport.referenceSlotIndex);
+    onProgress?.('Aligning personless slots via features…');
+    const refSlot = slots.find((s) => s.slotIndex === poseReport.referenceSlotIndex);
     const fallbackSlots = slots.filter((s) => fallbackSlotIndices.has(s.slotIndex));
     if (refSlot && fallbackSlots.length > 0) {
       const subList: AlignableSlot[] = [refSlot, ...fallbackSlots];
       const featureReport = await featureAlignViaWorker(subList, onProgress);
 
-      // Splice the fallback transforms back into the face report.
-      const merged: AlignResult[] = faceReport.results.map((r) => {
+      const merged: AlignResult[] = poseReport.results.map((r) => {
         if (!fallbackSlotIndices.has(r.slotIndex)) return r;
-        // Find the matching feature result
         const fr = featureReport.results.find((x) => x.slotIndex === r.slotIndex);
         if (fr && fr.status === 'aligned' && fr.transform) {
           return {
@@ -87,17 +78,16 @@ export async function smartAlign({ images, onProgress }: SmartAlignInput): Promi
             transform: fr.transform,
           };
         }
-        // Feature align also failed — keep the original failed result
         return r;
       });
 
       return {
         mode: 'face',
-        referenceSlotIndex: faceReport.referenceSlotIndex,
+        referenceSlotIndex: poseReport.referenceSlotIndex,
         results: merged,
       };
     }
-    return faceReport;
+    return poseReport;
   }
 
   // ---- Phase B: Feature matching for everything ----
