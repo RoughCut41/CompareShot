@@ -163,7 +163,6 @@ function preprocess(img: HTMLImageElement): PreprocessedImage {
  */
 function postprocess(
   output: Float32Array,
-  numChannels: number,
   numDetections: number,
   pre: PreprocessedImage,
   origW: number,
@@ -341,10 +340,9 @@ export async function detectPoseForSlots(
       const output = outputMap[outputName];
       const dims = output.dims; // [1, 56, 8400]
       const data = output.data as Float32Array;
-      const numChannels = dims[1];
       const numDetections = dims[2];
 
-      const people = postprocess(data, numChannels, numDetections, pre, img.naturalWidth, img.naturalHeight);
+      const people = postprocess(data, numDetections, pre, img.naturalWidth, img.naturalHeight);
       console.log('[CompareShot] Slot', slot.slotIndex, '— person candidates:', people.length);
 
       if (people.length === 0) {
