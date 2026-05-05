@@ -1,10 +1,18 @@
 /**
- * Pose-based Smart Align using YOLO11s-Pose via ONNX Runtime Web.
+ * V1.1 — Pose-based Smart Align with HeadScale-primary architecture.
  *
- * DIAGNOSTIC VERSION: extractAnchor logs each candidate measure separately
- * so we can see how Head-only measures (eye-to-eye, eye-mid-to-nose) compare
- * to Body measures (eye-to-shoulder, shoulder-width, etc.) before deciding
- * whether HeadScale-as-primary is the right architectural change.
+ * Changes from V1:
+ *  - HeadScale (from head-only keypoints) is the primary scale anchor
+ *  - BodyScale is only used as fallback when HeadReliability is low
+ *  - Length-weighted candidate weights via smoothstep
+ *  - Candidate Agreement score detects when head measures disagree
+ *  - HeadReliability as soft score (not hard product) so it doesn't collapse
+ *  - Smooth blend between Head and Body via smoothstep on reliability
+ *
+ * Anatomical ratios (eye-to-eye = 1.0 reference unit):
+ *   eye-mid-to-nose     ≈ 0.65
+ *   eye-to-nose-side    ≈ 0.82
+ *   ear-to-ear          ≈ 2.20  (only used when ears are confident & plausible)
  */
 import type { Tensor } from 'onnxruntime-web';
 import { decodeImage } from '@/lib/exportRenderer';
@@ -21,21 +29,45 @@ import {
 const INPUT_SIZE = 640;
 const CONFIDENCE_THRESHOLD = 0.25;
 const KEYPOINT_VIS_THRESHOLD = 0.5;
+const EAR_CONFIDENCE_THRESHOLD = 0.6; // ears are noisier, require higher confidence
 const MAX_GLOBAL_CROP = 1.15;
 const SAFETY_PX = 1;
 
 const MAX_PAN_X_FACTOR = 0.4;
 const MAX_PAN_Y_FACTOR = 1.0;
 
+// Anatomical ratios — values relative to eye-to-eye distance
+const RATIO_EYE_MID_NOSE = 0.65;
+const RATIO_EYE_NOSE_SIDE = 0.82;
+const RATIO_EAR_EAR = 2.20;
+
+// Length-weight smoothstep thresholds (in screen pixels after cover scaling)
+const LEN_W_LO = 12;
+const LEN_W_HI = 50;
+
+// Threshold above which a slot uses HeadScale as-is; below this it blends with Body
+const HEAD_RELIABILITY_HEAD_FAVORED = 0.65;
+const HEAD_RELIABILITY_BODY_FAVORED = 0.25;
+
 interface Keypoint { x: number; y: number; v: number; }
 interface Person { box: { x: number; y: number; w: number; h: number }; score: number; keypoints: Keypoint[]; }
+
+interface ScaleCandidate {
+  name: string;
+  px: number;
+  // value = px / anatomical_ratio. After this normalization, all candidates
+  // express the same underlying "person size" in pixels, so they can be
+  // compared/medianed directly.
+  value: number;
+  weight: number;
+}
 
 interface PoseData {
   slotIndex: number;
   anchorXNorm: number;
   anchorYNorm: number;
   anchorScale: number;
-  anchorMode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
+  anchorMode: 'head-primary' | 'head-body-blend' | 'body-fallback' | 'shoulders-only' | 'eye-to-eye';
   detectionScore: number;
   sharpness: number;
   naturalWidth: number;
@@ -89,6 +121,29 @@ function median(arr: number[]): number {
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = clamp01((x - edge0) / (edge1 - edge0));
+  return t * t * (3 - 2 * t);
+}
+
+function weightedMedian(items: ScaleCandidate[]): number | null {
+  const valid = items
+    .filter((i) => Number.isFinite(i.value) && i.weight > 0)
+    .sort((a, b) => a.value - b.value);
+  const total = valid.reduce((sum, i) => sum + i.weight, 0);
+  if (valid.length === 0 || total <= 0) return null;
+  let acc = 0;
+  for (const item of valid) {
+    acc += item.weight;
+    if (acc >= total / 2) return item.value;
+  }
+  return valid[valid.length - 1].value;
 }
 
 interface PreprocessedImage { data: Float32Array; scale: number; padX: number; padY: number; }
@@ -162,197 +217,312 @@ function nms(people: Person[], iouThreshold: number): Person[] {
   return kept;
 }
 
-interface RawAnchor {
-  anchorX: number; anchorY: number; anchorScale: number;
-  mode: 'multi-anchor' | 'shoulders-only' | 'eye-to-eye';
+const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+  Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+
+interface ScaleEstimate {
+  scale: number | null;
+  reliability: number;
+  agreement: number;
+  candidates: ScaleCandidate[];
 }
 
 /**
- * Extract anchor with separated HEAD vs BODY scale candidates for diagnostics.
- * Returns the same combined scale as before (no behavioral change), but logs
- * each candidate so we can analyze which measures are actually stable across
- * slots and decide if HeadScale-as-primary is the right architectural change.
+ * Estimate scale from head-only keypoints (eyes, nose, optional ears).
+ * Each candidate gets a weight based on:
+ *  - keypoint confidence (product of the two endpoints)
+ *  - length reliability (smoothstep — short distances are noise-prone)
+ *  - geometric reliability (yaw penalty for eye-eye and ear-ear when head is turned)
+ * Returns weighted-median scale, plus reliability scores for the caller.
  */
-function extractAnchor(person: Person, slotIndex: number): RawAnchor | null {
-  const kp = person.keypoints;
+function estimateHeadScale(kp: Keypoint[], cover: number): ScaleEstimate {
   const lEye = kp[KP.LEFT_EYE], rEye = kp[KP.RIGHT_EYE];
   const nose = kp[KP.NOSE];
   const lEar = kp[KP.LEFT_EAR], rEar = kp[KP.RIGHT_EAR];
+
+  const candidates: ScaleCandidate[] = [];
+
+  const eyesGood = lEye.v > KEYPOINT_VIS_THRESHOLD && rEye.v > KEYPOINT_VIS_THRESHOLD;
+  if (!eyesGood) {
+    return { scale: null, reliability: 0, agreement: 0, candidates };
+  }
+
+  const eyeMidX = (lEye.x + rEye.x) / 2;
+  const eyeMidY = (lEye.y + rEye.y) / 2;
+  const eyeEyePx = dist(lEye, rEye);
+
+  // Yaw indicator: how far is the nose from the eye midline (relative to eye-eye)
+  // If nose is far off-center, the head is yawed and eye-eye is foreshortened.
+  const noseGood = nose.v > KEYPOINT_VIS_THRESHOLD;
+  const noseOffsetRel = noseGood ? Math.abs(nose.x - eyeMidX) / Math.max(eyeEyePx, 1) : 0.5;
+  const yawReliability = 1 - smoothstep(0.15, 0.45, noseOffsetRel);
+
+  // Eye-to-eye: full yaw penalty applies (foreshortening hits this directly)
+  const eyeEyeScreen = eyeEyePx * cover;
+  candidates.push({
+    name: 'eye-eye',
+    px: eyeEyePx,
+    value: eyeEyePx / 1.0,
+    weight: lEye.v * rEye.v * smoothstep(LEN_W_LO, LEN_W_HI, eyeEyeScreen) * yawReliability,
+  });
+
+  if (noseGood) {
+    // Eye-to-nose distances suffer less from yaw — at least one side is usually still good.
+    const partialYaw = Math.max(0.5, yawReliability);
+
+    const eyeMidNosePx = dist({ x: eyeMidX, y: eyeMidY }, nose);
+    candidates.push({
+      name: 'eyeMid-nose',
+      px: eyeMidNosePx,
+      value: eyeMidNosePx / RATIO_EYE_MID_NOSE,
+      weight: Math.min(lEye.v, rEye.v) * nose.v *
+              smoothstep(LEN_W_LO, LEN_W_HI, eyeMidNosePx * cover) *
+              partialYaw,
+    });
+
+    const lEyeNosePx = dist(lEye, nose);
+    candidates.push({
+      name: 'lEye-nose',
+      px: lEyeNosePx,
+      value: lEyeNosePx / RATIO_EYE_NOSE_SIDE,
+      weight: lEye.v * nose.v *
+              smoothstep(LEN_W_LO, LEN_W_HI, lEyeNosePx * cover) *
+              partialYaw,
+    });
+
+    const rEyeNosePx = dist(rEye, nose);
+    candidates.push({
+      name: 'rEye-nose',
+      px: rEyeNosePx,
+      value: rEyeNosePx / RATIO_EYE_NOSE_SIDE,
+      weight: rEye.v * nose.v *
+              smoothstep(LEN_W_LO, LEN_W_HI, rEyeNosePx * cover) *
+              partialYaw,
+    });
+  }
+
+  // Ear-to-ear: only if both ears are clearly visible AND geometry is plausible
+  if (lEar.v > EAR_CONFIDENCE_THRESHOLD && rEar.v > EAR_CONFIDENCE_THRESHOLD) {
+    const earEarPx = dist(lEar, rEar);
+    const plausible = earEarPx > eyeEyePx * 1.4 && earEarPx < eyeEyePx * 3.0;
+    if (plausible) {
+      candidates.push({
+        name: 'ear-ear',
+        px: earEarPx,
+        value: earEarPx / RATIO_EAR_EAR,
+        weight: lEar.v * rEar.v *
+                smoothstep(LEN_W_LO * 1.5, LEN_W_HI * 1.5, earEarPx * cover) *
+                yawReliability,
+      });
+    }
+  }
+
+  const scale = weightedMedian(candidates);
+  const agreement = computeCandidateAgreement(candidates);
+
+  // Head reliability as a soft score (not hard product), so a single mediocre
+  // factor doesn't collapse the whole estimate.
+  const totalWeight = candidates.reduce((sum, c) => sum + c.weight, 0);
+  const usableCount = candidates.filter((c) => c.weight > 0.15).length;
+  const weightReliability = clamp01(totalWeight / 2.5);
+  const countReliability = clamp01(usableCount / 3);
+  const reliability = clamp01(0.40 * weightReliability + 0.25 * countReliability + 0.35 * agreement);
+
+  return { scale, reliability, agreement, candidates };
+}
+
+/**
+ * Estimate scale from body/torso keypoints (legacy V1 logic).
+ * Used as fallback when HeadReliability is low.
+ */
+function estimateBodyScale(kp: Keypoint[], cover: number): ScaleEstimate {
+  const lEye = kp[KP.LEFT_EYE], rEye = kp[KP.RIGHT_EYE];
+  const nose = kp[KP.NOSE];
   const lSh = kp[KP.LEFT_SHOULDER], rSh = kp[KP.RIGHT_SHOULDER];
   const lHip = kp[11], rHip = kp[12];
+
+  const candidates: ScaleCandidate[] = [];
 
   const eyesGood = lEye.v > KEYPOINT_VIS_THRESHOLD && rEye.v > KEYPOINT_VIS_THRESHOLD;
   const shouldersGood = lSh.v > KEYPOINT_VIS_THRESHOLD && rSh.v > KEYPOINT_VIS_THRESHOLD;
   const noseGood = nose.v > KEYPOINT_VIS_THRESHOLD;
-  const earsGood = lEar.v > KEYPOINT_VIS_THRESHOLD && rEar.v > KEYPOINT_VIS_THRESHOLD;
   const hipsGood = lHip && rHip && lHip.v > KEYPOINT_VIS_THRESHOLD && rHip.v > KEYPOINT_VIS_THRESHOLD;
 
-  const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
-    Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
-
-  // ===== DIAGNOSTIC LOGGING =====
-  // Log every available raw distance measure with its normalized scale.
-  // The "normalized scale" divides the measure by its expected anatomical
-  // ratio so all candidates can be compared on the same axis.
-
-  const headCandidates: Array<{ name: string; px: number; norm: number; conf: number }> = [];
-  const bodyCandidates: Array<{ name: string; px: number; norm: number; conf: number }> = [];
-
-  let eyeMidX = 0, eyeMidY = 0;
-  if (eyesGood) {
-    eyeMidX = (lEye.x + rEye.x) / 2;
-    eyeMidY = (lEye.y + rEye.y) / 2;
-
-    // HEAD: eye-to-eye (anatomical ratio 1.0 = our reference unit)
-    const eyeEyePx = dist(lEye, rEye);
-    headCandidates.push({
-      name: 'eye-eye',
-      px: eyeEyePx,
-      norm: eyeEyePx / 1.0,
-      conf: lEye.v * rEye.v,
-    });
-
-    if (noseGood) {
-      // HEAD: eye-mid-to-nose (anatomical ratio ~0.65)
-      const eyeMidNosePx = dist({ x: eyeMidX, y: eyeMidY }, nose);
-      headCandidates.push({
-        name: 'eyeMid-nose',
-        px: eyeMidNosePx,
-        norm: eyeMidNosePx / 0.65,
-        conf: Math.min(lEye.v, rEye.v) * nose.v,
-      });
-
-      // HEAD: left-eye-to-nose (anatomical ratio ~0.82)
-      const lEyeNosePx = dist(lEye, nose);
-      headCandidates.push({
-        name: 'lEye-nose',
-        px: lEyeNosePx,
-        norm: lEyeNosePx / 0.82,
-        conf: lEye.v * nose.v,
-      });
-
-      // HEAD: right-eye-to-nose (anatomical ratio ~0.82)
-      const rEyeNosePx = dist(rEye, nose);
-      headCandidates.push({
-        name: 'rEye-nose',
-        px: rEyeNosePx,
-        norm: rEyeNosePx / 0.82,
-        conf: rEye.v * nose.v,
-      });
-    }
-
-    if (earsGood) {
-      // HEAD: ear-to-ear (anatomical ratio ~2.2)
-      const earEarPx = dist(lEar, rEar);
-      // Plausibility: ear-ear should be 1.4×–3.0× eye-eye
-      const plausible = earEarPx > eyeEyePx * 1.4 && earEarPx < eyeEyePx * 3.0;
-      if (plausible) {
-        headCandidates.push({
-          name: 'ear-ear',
-          px: earEarPx,
-          norm: earEarPx / 2.2,
-          conf: lEar.v * rEar.v,
-        });
-      }
-    }
+  if (!shouldersGood) {
+    return { scale: null, reliability: 0, agreement: 0, candidates };
   }
 
-  if (eyesGood && shouldersGood) {
-    const shMidX = (lSh.x + rSh.x) / 2;
-    const shMidY = (lSh.y + rSh.y) / 2;
+  const shMidX = (lSh.x + rSh.x) / 2;
+  const shMidY = (lSh.y + rSh.y) / 2;
 
-    // BODY: eye-to-shoulder-mid (anatomical ratio 1.0 in old "Eye-to-Shoulder Units")
-    bodyCandidates.push({
+  if (eyesGood) {
+    const eyeMidX = (lEye.x + rEye.x) / 2;
+    const eyeMidY = (lEye.y + rEye.y) / 2;
+    const eyeShoulderPx = dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY });
+    candidates.push({
       name: 'eyeMid-shMid',
-      px: dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY }),
-      norm: dist({ x: eyeMidX, y: eyeMidY }, { x: shMidX, y: shMidY }),
-      conf: Math.min(lEye.v, rEye.v) * Math.min(lSh.v, rSh.v),
+      px: eyeShoulderPx,
+      value: eyeShoulderPx,
+      weight: Math.min(lEye.v, rEye.v) * Math.min(lSh.v, rSh.v) *
+              smoothstep(LEN_W_LO, LEN_W_HI, eyeShoulderPx * cover),
     });
+  }
 
-    // BODY: shoulder-width / 1.5
-    bodyCandidates.push({
-      name: 'sh-sh',
-      px: dist(lSh, rSh),
-      norm: dist(lSh, rSh) / 1.5,
-      conf: lSh.v * rSh.v,
+  const shWidthPx = dist(lSh, rSh);
+  candidates.push({
+    name: 'sh-sh',
+    px: shWidthPx,
+    value: shWidthPx / 1.5,
+    weight: lSh.v * rSh.v * smoothstep(LEN_W_LO, LEN_W_HI, shWidthPx * cover),
+  });
+
+  if (noseGood) {
+    const noseShPx = dist(nose, { x: shMidX, y: shMidY });
+    candidates.push({
+      name: 'nose-shMid',
+      px: noseShPx,
+      value: noseShPx / 0.85,
+      weight: nose.v * Math.min(lSh.v, rSh.v) * smoothstep(LEN_W_LO, LEN_W_HI, noseShPx * cover),
     });
-
-    if (noseGood) {
-      // BODY: nose-to-shoulder-mid / 0.85
-      bodyCandidates.push({
-        name: 'nose-shMid',
-        px: dist(nose, { x: shMidX, y: shMidY }),
-        norm: dist(nose, { x: shMidX, y: shMidY }) / 0.85,
-        conf: nose.v * Math.min(lSh.v, rSh.v),
-      });
-    }
-
-    if (hipsGood) {
-      const hipMidX = (lHip.x + rHip.x) / 2;
-      const hipMidY = (lHip.y + rHip.y) / 2;
-      // BODY: eye-to-hip-mid / 3.5
-      bodyCandidates.push({
-        name: 'eyeMid-hipMid',
-        px: dist({ x: eyeMidX, y: eyeMidY }, { x: hipMidX, y: hipMidY }),
-        norm: dist({ x: eyeMidX, y: eyeMidY }, { x: hipMidX, y: hipMidY }) / 3.5,
-        conf: Math.min(lEye.v, rEye.v) * Math.min(lHip.v, rHip.v),
-      });
-    }
   }
 
-  // Compute medians for diagnostic comparison
-  const headNorms = headCandidates.map((c) => c.norm);
-  const bodyNorms = bodyCandidates.map((c) => c.norm);
-  const headMedian = headNorms.length > 0 ? median(headNorms) : null;
-  const bodyMedian = bodyNorms.length > 0 ? median(bodyNorms) : null;
-
-  console.log(
-    '[CompareShot DIAG] Slot', slotIndex,
-    '— HEAD candidates:',
-    headCandidates.map((c) =>
-      `${c.name}(px=${c.px.toFixed(1)}, norm=${c.norm.toFixed(1)}, conf=${c.conf.toFixed(2)})`
-    ).join(', ')
-  );
-  console.log(
-    '[CompareShot DIAG] Slot', slotIndex,
-    '— BODY candidates:',
-    bodyCandidates.map((c) =>
-      `${c.name}(px=${c.px.toFixed(1)}, norm=${c.norm.toFixed(1)}, conf=${c.conf.toFixed(2)})`
-    ).join(', ')
-  );
-  console.log(
-    '[CompareShot DIAG] Slot', slotIndex,
-    '— headMedian:', headMedian !== null ? headMedian.toFixed(1) : 'n/a',
-    'bodyMedian:', bodyMedian !== null ? bodyMedian.toFixed(1) : 'n/a',
-    'head/body ratio:', (headMedian !== null && bodyMedian !== null) ? (headMedian / bodyMedian).toFixed(3) : 'n/a'
-  );
-
-  // ===== END DIAGNOSTIC LOGGING =====
-
-  // Behavior unchanged: same combined median as before.
-  if (eyesGood && shouldersGood) {
-    const eyeMidX_a = (lEye.x + rEye.x) / 2, eyeMidY_a = (lEye.y + rEye.y) / 2;
-    const shMidX = (lSh.x + rSh.x) / 2, shMidY = (lSh.y + rSh.y) / 2;
-    const measures: number[] = [];
-    measures.push(dist({ x: eyeMidX_a, y: eyeMidY_a }, { x: shMidX, y: shMidY }));
-    measures.push(dist(lSh, rSh) / 1.5);
-    measures.push(dist(lEye, rEye) / 0.4);
-    if (noseGood) measures.push(dist(nose, { x: shMidX, y: shMidY }) / 0.85);
-    if (hipsGood) {
-      const hipMidX = (lHip.x + rHip.x) / 2, hipMidY = (lHip.y + rHip.y) / 2;
-      measures.push(dist({ x: eyeMidX_a, y: eyeMidY_a }, { x: hipMidX, y: hipMidY }) / 3.5);
-    }
-    return { anchorX: eyeMidX_a, anchorY: eyeMidY_a, anchorScale: Math.max(1, median(measures)), mode: 'multi-anchor' };
+  if (eyesGood && hipsGood) {
+    const eyeMidX = (lEye.x + rEye.x) / 2;
+    const eyeMidY = (lEye.y + rEye.y) / 2;
+    const hipMidX = (lHip.x + rHip.x) / 2;
+    const hipMidY = (lHip.y + rHip.y) / 2;
+    const eyeHipPx = dist({ x: eyeMidX, y: eyeMidY }, { x: hipMidX, y: hipMidY });
+    candidates.push({
+      name: 'eyeMid-hipMid',
+      px: eyeHipPx,
+      value: eyeHipPx / 3.5,
+      weight: Math.min(lEye.v, rEye.v) * Math.min(lHip.v, rHip.v) *
+              smoothstep(LEN_W_LO, LEN_W_HI * 2, eyeHipPx * cover),
+    });
   }
-  if (shouldersGood) {
-    const shMidX = (lSh.x + rSh.x) / 2, shMidY = (lSh.y + rSh.y) / 2;
-    return { anchorX: shMidX, anchorY: shMidY, anchorScale: Math.max(1, dist(lSh, rSh)), mode: 'shoulders-only' };
-  }
+
+  const scale = weightedMedian(candidates);
+  const agreement = computeCandidateAgreement(candidates);
+  const totalWeight = candidates.reduce((sum, c) => sum + c.weight, 0);
+  const usableCount = candidates.filter((c) => c.weight > 0.15).length;
+  const weightReliability = clamp01(totalWeight / 2.5);
+  const countReliability = clamp01(usableCount / 2);
+  const reliability = clamp01(0.40 * weightReliability + 0.25 * countReliability + 0.35 * agreement);
+
+  return { scale, reliability, agreement, candidates };
+}
+
+/**
+ * Agreement score: how well do the candidates agree with each other?
+ * Returns 1 if they all agree closely, 0 if they disagree wildly.
+ * Used to detect when a single bad keypoint corrupts the estimate.
+ */
+function computeCandidateAgreement(candidates: ScaleCandidate[]): number {
+  const usable = candidates.filter((c) => c.weight > 0.15);
+  if (usable.length < 2) return 0.3;
+  const values = usable.map((c) => c.value);
+  const med = median(values);
+  const relErrors = values.map((v) => Math.abs(v - med) / Math.max(med, 1));
+  const medianRelError = median(relErrors);
+  return 1 - smoothstep(0.08, 0.25, medianRelError);
+}
+
+interface RawAnchor {
+  anchorX: number;
+  anchorY: number;
+  anchorScale: number;
+  mode: 'head-primary' | 'head-body-blend' | 'body-fallback' | 'shoulders-only' | 'eye-to-eye';
+}
+
+function extractAnchor(person: Person, slotIndex: number, cover: number): RawAnchor | null {
+  const kp = person.keypoints;
+  const lEye = kp[KP.LEFT_EYE], rEye = kp[KP.RIGHT_EYE];
+  const lSh = kp[KP.LEFT_SHOULDER], rSh = kp[KP.RIGHT_SHOULDER];
+
+  const eyesGood = lEye.v > KEYPOINT_VIS_THRESHOLD && rEye.v > KEYPOINT_VIS_THRESHOLD;
+  const shouldersGood = lSh.v > KEYPOINT_VIS_THRESHOLD && rSh.v > KEYPOINT_VIS_THRESHOLD;
+
+  // Position anchor: eye midpoint preferred, fall back to shoulders, then nothing.
+  let anchorX: number, anchorY: number;
   if (eyesGood) {
-    const eyeMidX_a = (lEye.x + rEye.x) / 2, eyeMidY_a = (lEye.y + rEye.y) / 2;
-    return { anchorX: eyeMidX_a, anchorY: eyeMidY_a, anchorScale: Math.max(1, dist(lEye, rEye)), mode: 'eye-to-eye' };
+    anchorX = (lEye.x + rEye.x) / 2;
+    anchorY = (lEye.y + rEye.y) / 2;
+  } else if (shouldersGood) {
+    anchorX = (lSh.x + rSh.x) / 2;
+    anchorY = (lSh.y + rSh.y) / 2;
+  } else {
+    return null;
   }
-  return null;
+
+  // Scale: try Head first, then Body as fallback
+  const head = estimateHeadScale(kp, cover);
+  const body = estimateBodyScale(kp, cover);
+
+  console.log(
+    '[CompareShot V1.1] Slot', slotIndex,
+    '— HEAD candidates:',
+    head.candidates.map((c) =>
+      `${c.name}(px=${c.px.toFixed(1)}, val=${c.value.toFixed(1)}, w=${c.weight.toFixed(2)})`
+    ).join(', ')
+  );
+  console.log(
+    '[CompareShot V1.1] Slot', slotIndex,
+    '— BODY candidates:',
+    body.candidates.map((c) =>
+      `${c.name}(px=${c.px.toFixed(1)}, val=${c.value.toFixed(1)}, w=${c.weight.toFixed(2)})`
+    ).join(', ')
+  );
+  console.log(
+    '[CompareShot V1.1] Slot', slotIndex,
+    `— headScale: ${head.scale !== null ? head.scale.toFixed(1) : 'n/a'}`,
+    `(reliability: ${head.reliability.toFixed(2)}, agreement: ${head.agreement.toFixed(2)})`,
+    `bodyScale: ${body.scale !== null ? body.scale.toFixed(1) : 'n/a'}`,
+    `(reliability: ${body.reliability.toFixed(2)}, agreement: ${body.agreement.toFixed(2)})`
+  );
+
+  // Choose final scale
+  let finalScale: number;
+  let mode: RawAnchor['mode'];
+
+  if (head.scale !== null && body.scale !== null) {
+    // Both available → smooth blend based on head reliability
+    const headWeight = smoothstep(HEAD_RELIABILITY_BODY_FAVORED, HEAD_RELIABILITY_HEAD_FAVORED, head.reliability);
+    const bodyWeight = 1 - headWeight;
+    finalScale = head.scale * headWeight + body.scale * bodyWeight;
+
+    if (headWeight > 0.85) mode = 'head-primary';
+    else if (headWeight < 0.15) mode = 'body-fallback';
+    else mode = 'head-body-blend';
+
+    console.log(
+      '[CompareShot V1.1] Slot', slotIndex,
+      `— chosen: ${mode} (headWeight=${headWeight.toFixed(2)}, finalScale=${finalScale.toFixed(1)})`
+    );
+  } else if (head.scale !== null) {
+    finalScale = head.scale;
+    mode = 'head-primary';
+    console.log('[CompareShot V1.1] Slot', slotIndex, '— chosen: head-primary (no body)');
+  } else if (body.scale !== null) {
+    finalScale = body.scale;
+    mode = shouldersGood ? 'shoulders-only' : 'body-fallback';
+    console.log('[CompareShot V1.1] Slot', slotIndex, '— chosen: body-fallback (no head)');
+  } else {
+    // Last resort: eye-to-eye if eyes are at least visible
+    if (eyesGood) {
+      finalScale = dist(lEye, rEye);
+      mode = 'eye-to-eye';
+      console.log('[CompareShot V1.1] Slot', slotIndex, '— chosen: eye-to-eye fallback');
+    } else {
+      return null;
+    }
+  }
+
+  return {
+    anchorX,
+    anchorY,
+    anchorScale: Math.max(1, finalScale),
+    mode,
+  };
 }
 
 export async function detectPoseForSlots(
@@ -385,7 +555,12 @@ export async function detectPoseForSlots(
         const a = people[k].box.w * people[k].box.h;
         if (a > bestArea) { best = people[k]; bestArea = a; }
       }
-      const anchor = extractAnchor(best, slot.slotIndex);
+
+      const cover = computeCoverScale(
+        img.naturalWidth, img.naturalHeight,
+        slot.state._containerW, slot.state._containerH
+      );
+      const anchor = extractAnchor(best, slot.slotIndex, cover);
       if (!anchor) { console.warn('[CompareShot] Slot', slot.slotIndex, '— no usable keypoints'); results.push(null); continue; }
       const W = img.naturalWidth, H = img.naturalHeight;
       const longEdge = Math.max(W, H);
@@ -529,7 +704,8 @@ export async function poseAlign(
     console.log(
       '[CompareShot] Slot', c.slotIndex,
       'onScreen:', (c.pose.anchorScale * Math.max(c.pose.naturalWidth, c.pose.naturalHeight) * c.cover).toFixed(1),
-      'scaleMatchZoom:', c.scaleMatchZoom.toFixed(3)
+      'scaleMatchZoom:', c.scaleMatchZoom.toFixed(3),
+      'mode:', c.pose.anchorMode
     );
   }
 
