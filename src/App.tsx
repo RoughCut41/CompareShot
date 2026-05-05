@@ -124,6 +124,7 @@ export default function App() {
         comparisonIndex={store.activeIndex[store.activeCategory]}
         onDeleteAll={store.deleteAllPhotos}
         onOpenDebugReport={handleOpenDebug}
+        onImportFolder={store.replaceAllData}
       />
       <CategoryTabs active={store.activeCategory} onSelect={store.switchCategory} />
       <ComparisonTabs
