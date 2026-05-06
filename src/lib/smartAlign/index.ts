@@ -4,17 +4,16 @@
  * Strategy:
  *  1. Run YOLO11n-Pose on all loaded images.
  *  2. If at least HALF the images have a detected person, use pose mode.
- *     Slots without a detected person fall back to feature matching.
- *  3. Otherwise, run feature matching on the main thread (AKAZE via OpenCV.js).
+ *     Slots without a detected person fall back to feature matching (worker).
+ *  3. Otherwise, run feature matching for everything (worker).
  *
- * Note: We use the main-thread `featureAlign` rather than the worker variant
- * because the worker's importScripts+ES-module setup is unreliable across
- * Vite builds. The main-thread version freezes the UI for a few seconds
- * during OpenCV computation but works reliably.
+ * Feature matching uses a Classic Web Worker so the UI stays responsive
+ * during AKAZE + RANSAC computation. OpenCV.js is loaded inside the worker
+ * from a same-origin URL (/opencv.js, downloaded at build time).
  */
 import { ImageState } from '@/lib/types';
 import { detectPoseForSlots, poseAlign } from './poseAlign';
-import { featureAlign } from './featureAlign';
+import { featureAlignViaWorker } from './workerClient';
 import { AlignableSlot, AlignResult, ProgressCallback, SmartAlignReport } from './types';
 
 export type { SmartAlignReport, AlignResult, AlignTransform } from './types';
@@ -58,7 +57,6 @@ export async function smartAlign({ images, onProgress }: SmartAlignInput): Promi
 
   if (usePoseMode) {
     const poseReport = await poseAlign(slots, poseDetections, onProgress);
-    // Identify slots that need feature fallback (no person detected on those)
     const fallbackSlotIndices = new Set<number>();
     for (const r of poseReport.results) {
       if (r.status === 'failed' && r.reason && r.reason.includes('fall back')) {
@@ -73,7 +71,7 @@ export async function smartAlign({ images, onProgress }: SmartAlignInput): Promi
     const fallbackSlots = slots.filter((s) => fallbackSlotIndices.has(s.slotIndex));
     if (refSlot && fallbackSlots.length > 0) {
       const subList: AlignableSlot[] = [refSlot, ...fallbackSlots];
-      const featureReport = await featureAlign(subList, onProgress);
+      const featureReport = await featureAlignViaWorker(subList, onProgress);
       const merged: AlignResult[] = poseReport.results.map((r) => {
         if (!fallbackSlotIndices.has(r.slotIndex)) return r;
         const fr = featureReport.results.find((x) => x.slotIndex === r.slotIndex);
@@ -95,6 +93,6 @@ export async function smartAlign({ images, onProgress }: SmartAlignInput): Promi
     return poseReport;
   }
 
-  // ---- Phase B: Feature matching for everything (main thread) ----
-  return featureAlign(slots, onProgress);
+  // ---- Phase B: Feature matching for everything (worker) ----
+  return featureAlignViaWorker(slots, onProgress);
 }
