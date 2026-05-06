@@ -1,7 +1,13 @@
 /**
  * Lazy-loads OpenCV.js from the local same-origin URL. Cached after first load.
+ *
+ * Why local: COEP (Cross-Origin-Embedder-Policy: require-corp) is set in our
+ * server config to enable SharedArrayBuffer for ONNX Runtime Web. This blocks
+ * external CDN scripts that don't send a CORP header. Hosting opencv.js on
+ * the same origin sidesteps the issue entirely.
+ *
  * The opencv.js file is downloaded at build time by scripts/download-models.mjs
- * and served from /public, which avoids COEP/CORS issues that block external CDNs.
+ * into public/opencv.js, served by Vite/Vercel as a same-origin asset.
  */
 
 declare global {
@@ -44,6 +50,13 @@ function loadScript(url: string, timeoutMs = 60000): Promise<void> {
   });
 }
 
+/**
+ * Wait until window.cv exists AND has cv.Mat available.
+ *
+ * OpenCV.js builds vary: some set cv synchronously, some need
+ * onRuntimeInitialized to fire after WASM loads. We hint via the callback
+ * AND poll for cv.Mat to handle both cases.
+ */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function waitForCvRuntime(timeoutMs = 60000): Promise<any> {
   return new Promise((resolve, reject) => {
