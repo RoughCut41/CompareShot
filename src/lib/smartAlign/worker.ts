@@ -4,6 +4,10 @@
  * Loads OpenCV.js in a separate thread so the main UI never freezes during
  * heavy computation. The main thread sends down-scaled ImageData arrays +
  * image metadata; the worker returns AlignTransform objects ready to apply.
+ *
+ * OpenCV.js is loaded from the same origin (/opencv.js) — placed there at
+ * build time by scripts/download-models.mjs. Using a same-origin URL avoids
+ * COEP cross-origin blocking that affects external CDNs.
  */
 
 /// <reference lib="webworker" />
@@ -79,30 +83,20 @@ function progress(label: string) {
 }
 
 // ---- OpenCV loader inside the worker ----
+// Uses the same-origin /opencv.js asset (downloaded at build time) to avoid
+// COEP blocking that prevents CDN scripts from loading.
 
-const OPENCV_URLS = [
-  'https://docs.opencv.org/4.8.0/opencv.js',
-  'https://cdnjs.cloudflare.com/ajax/libs/opencv.js/4.8.0/opencv.js',
-];
+const OPENCV_URL = '/opencv.js';
 
 let cvReadyPromise: Promise<void> | null = null;
 
 function loadOpenCV(): Promise<void> {
   if (cvReadyPromise) return cvReadyPromise;
   cvReadyPromise = (async () => {
-    let lastErr: Error | null = null;
-    for (const url of OPENCV_URLS) {
-      try {
-        progress(`Loading OpenCV from ${new URL(url).hostname}…`);
-        self.importScripts(url);
-        progress('Initializing OpenCV runtime…');
-        await waitForCvMat();
-        return;
-      } catch (err) {
-        lastErr = err instanceof Error ? err : new Error(String(err));
-      }
-    }
-    throw lastErr ?? new Error('All OpenCV CDNs failed');
+    progress('Loading OpenCV…');
+    self.importScripts(OPENCV_URL);
+    progress('Initializing OpenCV runtime…');
+    await waitForCvMat();
   })();
   return cvReadyPromise;
 }
@@ -133,9 +127,6 @@ function waitForCvMat(timeoutMs = 60000): Promise<void> {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function imageDataToMat(data: ImageData): any {
-  // cv.imread() expects an HTMLImageElement/HTMLCanvasElement, which doesn't
-  // exist in workers. cv.matFromImageData() takes raw ImageData and works
-  // in any context (main thread or worker).
   return cv.matFromImageData(data);
 }
 
@@ -180,7 +171,7 @@ interface FeatureSet {
   kpCount: number;
 }
 
-// ---- Similarity Transform via RANSAC (replacement for cv.estimateAffinePartial2D) ----
+// ---- Similarity Transform via RANSAC ----
 
 interface Similarity {
   a: number;
@@ -410,7 +401,6 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
         dstPts.push(dp.x / reference.payload.preScale, dp.y / reference.payload.preScale);
       }
 
-      // Estimate similarity transform via custom RANSAC
       const sim = estimateSimilarityRANSAC(srcPts, dstPts);
       if (!sim) {
         results.push({
@@ -454,15 +444,6 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
       let panY = (mappedY - refCyImg) * refCover;
       let finalZoom = Math.max(0.2, Math.min(5, zoom));
 
-      // "Auto-fill": bump up the zoom so that no black borders are visible.
-      // At zoom Z, the displayed image extends Z * containerW/2 from the rendered
-      // center horizontally (and same for vertical with containerH/2). After
-      // applying pan, the visible-without-black-border condition is:
-      //   |panX| + containerW/2 <= Z * containerW/2
-      //   |panY| + containerH/2 <= Z * containerH/2
-      // so Z must be at least max(1 + 2|panX|/cw, 1 + 2|panY|/ch).
-      // We also have to consider rotation — rotating expands the bounding box by
-      // roughly |cos| + |sin| in each axis, so we add a small safety margin.
       const cw = cur.payload.containerW > 0 ? cur.payload.containerW : 960;
       const ch = cur.payload.containerH > 0 ? cur.payload.containerH : 1625;
       const rotRadAbs = Math.abs((rotDeg * Math.PI) / 180);
@@ -471,15 +452,11 @@ async function runAlignment(slots: SlotPayload[]): Promise<DoneMessage> {
       const minZoomY = (1 + (2 * Math.abs(panY)) / ch) * rotExpand;
       const minZoom = Math.max(minZoomX, minZoomY);
       if (finalZoom < minZoom) {
-        // Scale up: we want to multiply zoom by k = minZoom/finalZoom. To keep the
-        // *content* aligned (the feature points still landing at the same on-screen
-        // position), we also scale pan by k.
         const k = minZoom / finalZoom;
         finalZoom = minZoom;
         panX *= k;
         panY *= k;
       }
-      // Re-clamp in case minZoom was extreme (very large pan)
       finalZoom = Math.min(finalZoom, 5);
 
       results.push({
