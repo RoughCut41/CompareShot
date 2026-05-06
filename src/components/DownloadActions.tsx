@@ -32,6 +32,20 @@ type BusyState =
   | 'photos-current'
   | 'photos-all';
 
+/**
+ * Display names for filenames. Internal category keys map to user-facing
+ * suffixes used in exported PNG/ZIP file names.
+ */
+const CATEGORY_FILENAME: Record<Category, string> = {
+  wide: 'photo',
+  ultrawide: 'photo-uw',
+  portrait: 'portrait',
+  front: 'front',
+  macro: 'macro',
+  'low-light': 'night',
+  zoom: 'zoom',
+};
+
 export function DownloadActions({
   comparison,
   category,
@@ -77,7 +91,7 @@ export function DownloadActions({
     try {
       const canvas = await renderCollageCanvas(comparison.images);
       const blob = await canvasToPngBlob(canvas);
-      downloadBlob(blob, `Collage-${category}-comp${comparisonIndex + 1}.png`);
+      downloadBlob(blob, `Collage-${CATEGORY_FILENAME[category]}-${comparisonIndex + 1}.png`);
     } catch (err) {
       console.error('Collage export failed', err);
       alert('Collage-Export fehlgeschlagen: ' + (err instanceof Error ? err.message : 'Unbekannter Fehler'));
@@ -97,7 +111,7 @@ export function DownloadActions({
         const canvas = await renderImageToExportCanvas(img);
         const blob = await canvasToPngBlob(canvas);
         const letter = SLOT_LETTERS[i] ?? `${i + 1}`;
-        downloadBlob(blob, `${letter}-${category}-comp${comparisonIndex + 1}.png`);
+        downloadBlob(blob, `${letter}-${CATEGORY_FILENAME[category]}-${comparisonIndex + 1}.png`);
         await sleep(200);
       }
     } catch (err) {
@@ -160,7 +174,7 @@ export function DownloadActions({
             const canvas = await renderImageToExportCanvas(img);
             const blob = await canvasToPngBlob(canvas);
             const letter = SLOT_LETTERS[slotIdx] ?? `${slotIdx + 1}`;
-            const filename = `${cat}_comp${compIdx + 1}_${letter}.png`;
+            const filename = `${letter}-${CATEGORY_FILENAME[cat]}-${compIdx + 1}.png`;
             zip.file(filename, blob);
             done++;
             setProgress({ current: done, total: countAllPhotos() });
@@ -194,7 +208,7 @@ export function DownloadActions({
           if (!comp.images.some((img) => img !== null)) continue;
           const canvas = await renderCollageCanvas(comp.images);
           const blob = await canvasToPngBlob(canvas);
-          const filename = `${cat}_comp${compIdx + 1}_collage.png`;
+          const filename = `Collage-${CATEGORY_FILENAME[cat]}-${compIdx + 1}.png`;
           zip.file(filename, blob);
           done++;
           setProgress({ current: done, total: countAllCollages() });
