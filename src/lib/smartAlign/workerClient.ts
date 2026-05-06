@@ -1,7 +1,9 @@
 /**
  * Main-thread client for the Smart Align worker.
- * Handles spawning the worker, downscaling images on the main thread (fast),
- * and translating worker messages back into the SmartAlignReport shape.
+ *
+ * Spawns a Classic Web Worker (type: 'classic') so that importScripts() works
+ * inside the worker — needed to load OpenCV.js at runtime. Module workers
+ * don't support importScripts.
  */
 import { decodeImage } from '@/lib/exportRenderer';
 import {
@@ -13,7 +15,10 @@ import {
 
 const ANALYSIS_MAX_DIM = 800;
 
-function downscaleToImageData(img: HTMLImageElement, maxDim: number): { data: ImageData; scale: number } {
+function downscaleToImageData(
+  img: HTMLImageElement,
+  maxDim: number
+): { data: ImageData; scale: number } {
   const ratio = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
   const w = Math.max(1, Math.round(img.naturalWidth * ratio));
   const h = Math.max(1, Math.round(img.naturalHeight * ratio));
@@ -40,7 +45,6 @@ export async function featureAlignViaWorker(
 
   onProgress?.('Preparing images…');
 
-  // Decode + downscale every image on the main thread (fast — milliseconds per image)
   const payloads = await Promise.all(
     slots.map(async (s) => {
       const img = await decodeImage(s.state.url);
@@ -62,7 +66,8 @@ export async function featureAlignViaWorker(
   return new Promise<SmartAlignReport>((resolve, reject) => {
     let worker: Worker;
     try {
-      worker = new Worker(new URL('./worker.ts', import.meta.url));
+      // Classic worker: required so importScripts() works in worker.ts to load OpenCV
+      worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'classic' });
     } catch (err) {
       reject(err);
       return;
@@ -104,10 +109,14 @@ export async function featureAlignViaWorker(
     worker.onerror = (e) => {
       window.clearTimeout(timeout);
       worker.terminate();
-      reject(new Error(`Worker error: ${e.message}`));
+      // ErrorEvent.message can be empty when the worker fails at module-load time;
+      // surface filename/lineno so we can debug what actually broke.
+      const msg =
+        e.message ||
+        (e.filename ? `Worker load error in ${e.filename}:${e.lineno}` : 'Worker error');
+      reject(new Error(msg));
     };
 
-    // Use transferable ImageData buffers for zero-copy hand-off
     const transferables = payloads.map((p) => p.imageData.data.buffer);
     worker.postMessage({ type: 'run', slots: payloads }, transferables);
   });
