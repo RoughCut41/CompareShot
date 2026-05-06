@@ -8,6 +8,8 @@ interface Props {
   comparison: Comparison | undefined;
   category: Category;
   comparisonIndex: number;
+  /** Full app data — needed by DownloadActions for "all categories" exports */
+  allData: CategoryData;
   onDeleteAll: () => void;
   onOpenDebugReport: () => void;
   onImportFolder: (data: CategoryData) => void;
@@ -17,6 +19,7 @@ export function Header({
   comparison,
   category,
   comparisonIndex,
+  allData,
   onDeleteAll,
   onOpenDebugReport,
   onImportFolder,
@@ -46,6 +49,7 @@ export function Header({
           comparison={comparison}
           category={category}
           comparisonIndex={comparisonIndex}
+          allData={allData}
           onDeleteAll={onDeleteAll}
           onOpenDebugReport={onOpenDebugReport}
         />
