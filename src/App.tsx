@@ -119,13 +119,14 @@ export default function App() {
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-zinc-200">
       <Header
-        comparison={store.activeComparison}
-        category={store.activeCategory}
-        comparisonIndex={store.activeIndex[store.activeCategory]}
-        onDeleteAll={store.deleteAllPhotos}
-        onOpenDebugReport={handleOpenDebug}
-        onImportFolder={store.replaceAllData}
-      />
+  comparison={store.activeComparison}
+  category={store.activeCategory}
+  comparisonIndex={store.activeIndex[store.activeCategory]}
+  allData={store.data}
+  onDeleteAll={store.deleteAllPhotos}
+  onOpenDebugReport={handleOpenDebug}
+  onImportFolder={store.replaceAllData}
+/>
       <CategoryTabs active={store.activeCategory} onSelect={store.switchCategory} />
       <ComparisonTabs
         comparisons={store.data[store.activeCategory]}
