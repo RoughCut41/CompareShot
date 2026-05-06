@@ -1,11 +1,7 @@
 /**
- * Lazy-loads OpenCV.js. Cached after first successful load.
- * Returns the global `cv` namespace once it's fully initialized (cv.Mat ready).
- *
- * Strategy: try a list of CDNs in order, then poll for cv.Mat availability.
- * Polling is the only approach that works reliably across all OpenCV.js
- * build variants (some expose cv as a thenable factory, some need
- * onRuntimeInitialized, some are ready synchronously).
+ * Lazy-loads OpenCV.js from the local same-origin URL. Cached after first load.
+ * The opencv.js file is downloaded at build time by scripts/download-models.mjs
+ * and served from /public, which avoids COEP/CORS issues that block external CDNs.
  */
 
 declare global {
@@ -15,15 +11,12 @@ declare global {
   }
 }
 
-const CDNS = [
-  'https://docs.opencv.org/4.8.0/opencv.js',
-  'https://cdnjs.cloudflare.com/ajax/libs/opencv.js/4.8.0/opencv.js',
-];
+const OPENCV_URL = '/opencv.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let cvPromise: Promise<any> | null = null;
 
-function loadScript(url: string, timeoutMs = 30000): Promise<void> {
+function loadScript(url: string, timeoutMs = 60000): Promise<void> {
   return new Promise((resolve, reject) => {
     const existing = document.querySelector(`script[data-cv-src="${url}"]`);
     if (existing) {
@@ -51,18 +44,8 @@ function loadScript(url: string, timeoutMs = 30000): Promise<void> {
   });
 }
 
-/**
- * Wait until window.cv exists AND has cv.Mat available.
- *
- * Some OpenCV.js builds set cv synchronously when the script loads (cv.Mat is
- * ready immediately). Others set cv as a "Module" object that fires
- * onRuntimeInitialized only after the WASM has loaded. A few builds expose cv
- * as a thenable factory. We sidestep all of this by:
- *   1. Setting onRuntimeInitialized as a hint (in case the build uses it)
- *   2. Polling cv.Mat in a loop
- */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function waitForCvRuntime(timeoutMs = 30000): Promise<any> {
+function waitForCvRuntime(timeoutMs = 60000): Promise<any> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     let resolved = false;
@@ -75,7 +58,6 @@ function waitForCvRuntime(timeoutMs = 30000): Promise<any> {
       }
     };
 
-    // Hint for builds that use the Emscripten init callback
     if (typeof window.cv !== 'undefined' && !window.cv.Mat) {
       try {
         window.cv['onRuntimeInitialized'] = finish;
@@ -102,18 +84,8 @@ function waitForCvRuntime(timeoutMs = 30000): Promise<any> {
 export function loadOpenCV(): Promise<any> {
   if (cvPromise) return cvPromise;
   cvPromise = (async () => {
-    let lastErr: Error | null = null;
-    for (const url of CDNS) {
-      try {
-        await loadScript(url);
-        const cv = await waitForCvRuntime();
-        return cv;
-      } catch (err) {
-        lastErr = err instanceof Error ? err : new Error(String(err));
-        console.warn('[CompareShot] OpenCV load failed for', url, '— trying next');
-      }
-    }
-    throw lastErr ?? new Error('All OpenCV CDNs failed');
+    await loadScript(OPENCV_URL);
+    return await waitForCvRuntime();
   })().catch((err) => {
     cvPromise = null; // allow retry on next call
     throw err;
