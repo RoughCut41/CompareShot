@@ -44,8 +44,8 @@ export type ActiveIndexMap = Record<Category, number>;
 
 export const MIN_SLOTS = 2;
 export const MAX_SLOTS = 8;
-export const EXPORT_WIDTH = 960;
-export const EXPORT_HEIGHT = 1625;
+export const EXPORT_WIDTH = 1920;
+export const EXPORT_HEIGHT = 3250;
 export const EXPORT_ASPECT = EXPORT_WIDTH / EXPORT_HEIGHT;
 
 export const SLOT_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'] as const;
